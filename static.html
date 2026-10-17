@@ -1,0 +1,1206 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NR Static Analysis</title><style>:root{--bg:#f6f5f2;--card:#fff;--ink:#1d1d1f;--muted:#6b6b70;--line:#e2e0db;--accent:#2d5fd3}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#141416;--card:#1d1d21;--ink:#ecebe8;--muted:#9a99a0;--line:#303036;--accent:#6f97ff}}
+:root[data-theme="dark"]{--bg:#141416;--card:#1d1d21;--ink:#ecebe8;--muted:#9a99a0;--line:#303036;--accent:#6f97ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1200px;margin:0 auto;padding:24px 16px 60px}a{color:var(--accent)}
+h1{font-size:26px;margin:0 0 8px}h2{font-size:19px;margin:28px 0 8px;padding-top:8px;border-top:1px solid var(--line)}h3{font-size:16px;margin:18px 0 6px}
+table{border-collapse:collapse;width:100%;font-size:13.5px;margin:8px 0 14px;display:block;overflow-x:auto}
+td,th{padding:5px 8px;border:1px solid var(--line);vertical-align:top;text-align:left}th{background:var(--card)}
+code{font-size:12.5px;background:var(--card);padding:1px 5px;border-radius:5px;border:1px solid var(--line);word-break:break-word}
+pre{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px;overflow-x:auto}pre code{border:0;padding:0}
+li{margin:3px 0}hr{border:0;border-top:2px solid var(--line);margin:30px 0}</style></head><body><main>
+<h1>NR runtimes 310.8 and 310.9.16: static analysis (full technical)</h1>
+<p><a href="index.html">Back to the report</a> · <a href="controlmask.html">ControlMask how-to</a> · <a href="noisy-domain.html">Noisy-domain NR feasibility</a></p>
+<p><strong>Written by Claude Opus 5.5 (Claude Code, high effort) on behalf of GrimsVerk, who skimmed it. The research, the test-build code changes, the measurements and this text are Claude's work.</strong></p>
+<p>Files: <code>nvngx_dlssnr.dll</code> <strong>310.8.0.0</strong> (CL 38718415, 165,840,496 bytes, SHA-256 <code>4b8d19bc3eff58a084f5eca7489c921501c203450169fb82ff4f649a4482ba05</code>) and <strong>310.9.16.0</strong> (CL 39025366, 266,424,944 bytes, SHA-256 <code>2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f</code>).</p>
+<p>Method:</p>
+<ul>
+<li>PE inventory with pefile; strings (ASCII and UTF-16) diffed between versions.</li>
+<li>Resource and weight-container parsing.</li>
+<li>CUDA fatbins unpacked (zstd) to PTX and SASS ELF.</li>
+<li>Full Ghidra 12.1.4 auto-analysis and decompile of both DLLs, image base <code>0x180000000</code>.</li>
+</ul>
+<p>"Seen in game" means the runtime's own NGX log confirmed it in The Witcher 3. The log was switched on with the <code>__NGX_LOG_LEVEL</code> environment variable, set in-process by the research build.</p>
+<p><strong>About line numbers.</strong> "l.NNNN" refers to a full decompile export (every function, Ghidra 12.1.4 default analysis, in address order). They only help if you make the same export. <strong>Function names and addresses (<code>FUN_18xxxxxxx</code>) are the stable reference</strong>: they are identical in any Ghidra project of the same file with the same base.</p>
+<h2>1. Summary</h2>
+<ul>
+<li><strong>Exactly two models exist, and only 310.9.16 has both:</strong><ul>
+<li><code>CC_Control_History_Blend_Quantize_With_Teacher_honest_tench_2026_07_04_22_30_weights</code> ("honest tench"), resource <code>WEIGHTS_HT</code>, 147,695,410 bytes;</li>
+<li><code>hnet-crazy-cuckoo-small-fp8</code> ("crazy cuckoo small"), resource <code>WEIGHTS_CC_SMALL_FP8</code>, 113,893,343 bytes.</li>
+</ul>
+</li>
+<li><strong><code>WEIGHTS_HT</code> is byte-identical in both DLLs.</strong> The ~100 MB growth of 310.9.16 is the new small model.</li>
+<li><strong>Presets:</strong><ul>
+<li><strong>310.8</strong> registers one preset (1 = honest tench); every value falls back to it, so <strong>Preset has no effect in 310.8</strong>.</li>
+<li><strong>310.9.16</strong> registers preset 1 (honest tench) and preset 2 (crazy cuckoo). <strong>0/auto and every unknown value fall back to preset 2</strong> (seen in game: "preset 0 is not available in this DLL build; falling back to shipping default preset 2 ('hnet-crazy-cuckoo-small-fp8')").</li>
+</ul>
+</li>
+<li><strong><code>hnet-almond-eagle-11m</code> is not a third model.</strong> It is the string the on-screen indicator draws <em>in place of</em> <code>hnet-crazy-cuckoo-small-fp8</code> (<code>strcmp</code> + swap in <code>FUN_18001c120</code>). Nothing else references it.</li>
+<li><strong>No hidden presets, styles, models, weight files or debug views</strong> exist in either file. The weight registry, the descriptor list and the style tables were all read directly.</li>
+<li><strong>Style is 0/1/2 in both versions;</strong> values ≥ 3 clamp to 2. Style is a network input <em>and</em> a colour grade applied to the result (section 4).</li>
+<li><strong>New in 310.9.16:</strong> <code>DLSSNR.MaskBlendMode</code> (0-3). It only has an effect with a supplied <code>DLSSNR.ControlMask</code> and AutoMask on.</li>
+<li><strong>310.9.16 dropped Ada (RTX 40):</strong> CreateFeature only accepts arch 0x1B0, and only sm_120 code ships. 310.8 accepts 0x190 and 0x1B0 and ships sm_89 SASS.</li>
+<li><strong>Both versions run both models in FP8.</strong> 310.8 also ships FP16 kernels, but they are unused.</li>
+<li><strong>Parameters with no effect in either version:</strong><ul>
+<li>Depth / DepthInverted: the network's depth slot is hard-wired to null.</li>
+<li>BidirectionalDistortionField: sets a telemetry bit only.</li>
+<li>ScalingRatio / PerfQualityValue: never used for anything.</li>
+<li>Intensity above 1: clamped.</li>
+</ul>
+</li>
+<li><strong>A runtime-side reduced-resolution path with guided upsample exists, but it is dead code:</strong> its scale is fixed at 1.0. Downscaling must stay app-side.</li>
+</ul>
+<h2>2. PE inventory</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>310.8</th>
+<th>310.9.16</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>File size</td>
+<td>165,840,496</td>
+<td>266,424,944</td>
+</tr>
+<tr>
+<td>FileVersion / OriginalFilename</td>
+<td>310.8.0.0 / CL 38718415</td>
+<td>310.9.16.0 / CL 39025366</td>
+</tr>
+<tr>
+<td>Source branch (paths in strings)</td>
+<td><code>snippets/rel_310_8</code></td>
+<td><code>snippets/rel_310_9</code></td>
+</tr>
+<tr>
+<td>NGXAppId (version resource)</td>
+<td>literal <code>APP_ID_HASH</code></td>
+<td>241534723</td>
+</tr>
+<tr>
+<td>NGXGpuArchitecture / NGXApiVersion / NGXMinimumDriverVersion</td>
+<td>Blackwell2 / 0x13 / 615.00</td>
+<td>same</td>
+</tr>
+<tr>
+<td>TimeDateStamp</td>
+<td>1786480171</td>
+<td>1790318716</td>
+</tr>
+<tr>
+<td>SizeOfImage</td>
+<td>0x9e42000</td>
+<td>0xfe2f000</td>
+</tr>
+<tr>
+<td>Exports</td>
+<td>55, identical names: D3D11/D3D12/Vulkan/CUDA entry points, GetAPIVersion, GetApplicationId, GetDriverVersionEx, GetGPUArchitecture, GetSnippetVersion, SetOverrideStatusCallback, SetRuntimeParamsCallback, SetTelemetryEvaluateCallback</td>
+<td>same 55</td>
+</tr>
+<tr>
+<td>Imports</td>
+<td>KERNEL32 (120), ADVAPI32 (3), USER32 (1), VERSION (3). CUDA/D3D/Vulkan only through NGX core callbacks</td>
+<td>same</td>
+</tr>
+<tr>
+<td>.text (VA / raw size)</td>
+<td>0x1000 / 0xaae00</td>
+<td>0x1000 / 0xd5400</td>
+</tr>
+<tr>
+<td>.rdata</td>
+<td>0xac000 / 0x33800</td>
+<td>0xd7000 / 0x38800</td>
+</tr>
+<tr>
+<td>.data</td>
+<td>0xe0000 / 0x1062800 (16.5 MB, entropy 5.3)</td>
+<td>0x110000 / 0x380a00 (3.7 MB, entropy 8.0)</td>
+</tr>
+<tr>
+<td>.rsrc</td>
+<td>0x1165000 / 0x8cdae00</td>
+<td>0x4b4000 / 0xf978e00</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Resources</strong> (type 10 = RCDATA):</p>
+<table>
+<thead>
+<tr>
+<th>Resource</th>
+<th>310.8 RVA / file offset / size</th>
+<th>310.9.16 RVA / file offset / size</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>WEIGHTS_HT</code></td>
+<td>0x1165560 / 0x114a160 / 147,695,410</td>
+<td>0x4b45b8 / 0x498db8 / 147,695,410 (identical bytes)</td>
+</tr>
+<tr>
+<td><code>WEIGHTS_CC_SMALL_FP8</code></td>
+<td>absent</td>
+<td>0x918ecf0 / 0x91734f0 / 113,893,343</td>
+</tr>
+<tr>
+<td>VS_VERSION_INFO</td>
+<td>0x11650c0 / 0x1149cc0 / 1184</td>
+<td>0x4b4110 / 0x498910 / 1188</td>
+</tr>
+</tbody>
+</table>
+<p><strong>CUDA fatbins</strong> (magic <code>50 ED 55 BA</code>). Payloads are zstd-compressed. 310.8: each fatbin has sm_89 SASS + sm_120 PTX + sm_120 SASS. 310.9.16: sm_120 PTX + sm_120 SASS only. File offsets:</p>
+<ul>
+<li>310.8: 0xdf0e0 0x4a2220 0x6fe100 0x94cb60 0xbd0990 0xdd4bc0 0x10e2a40 0x1121b90 0x1123af0 0x1126590 0x11293b0 0x112bd00 0x112e3f0 0x112fd90 0x113d3c0</li>
+<li>310.9.16: 0x10e6d0 0x1dbed0 0x263ec0 0x2df920 0x36ed70 0x3d8990 0x45d280 0x46f140 0x4710a0 0x473b40 0x476960 0x4792b0 0x47b9a0 0x47d340 0x48a970<ul>
+<li>The fused pre/post-block kernels are in the fatbin at 0x10e6d0; <code>cg2r_post_process_kernel</code> is in the one at 0x47d340.</li>
+</ul>
+</li>
+</ul>
+<p>PTX entry points: 310.8 has 231 (FP16 + FP8 variants); 310.9.16 has 120 (FP8 only, plus <code>cc_cb_clear</code>, <code>cg2r_copy_kernel</code>, <code>cg2r_post_process_kernel</code>, and the <code>cuda_capture_*</code>/<code>cuda_font_kernel</code> NGX helpers). Every 310.9.16 kernel name also exists in 310.8. No ONNX, TensorRT plans, LZ4 or DXBC were found. There is one SPIR-V blob in each (NGX helper).</p>
+<p><strong>Weights container format</strong> (both resources): <code>u64 total size</code>, then per tensor <code>u64 name length, name, u64 record length, [u64 record length, u64 data length, u32 flag, data, 20-byte trailer: u64 0, u64 1, u32 element count]</code>. Tensors are named <code>blockN.layerM.layer</code>, plus one <code>blockN.layer0.blend_scale</code> (2 bytes). Element counts equal data length / 2.</p>
+<h2>3. The two models</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>honest tench (preset 1)</th>
+<th>crazy cuckoo small (preset 2, 310.9.16 default)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>In 310.8 / 310.9.16</td>
+<td>yes / yes</td>
+<td>no / yes</td>
+</tr>
+<tr>
+<td>Tensors</td>
+<td>153 (71 blocks)</td>
+<td>77 (31 blocks)</td>
+</tr>
+<tr>
+<td>Weight bytes</td>
+<td>147.7 MB</td>
+<td>113.9 MB</td>
+</tr>
+<tr>
+<td>GPU weight heap (seen in game)</td>
+<td>140.9 MB</td>
+<td>108.6 MB</td>
+</tr>
+<tr>
+<td>GPU work pool at 3840x2160 (seen in game)</td>
+<td>727.7 MB in 310.8 · 528.5 MB in 310.9.16</td>
+<td>526.6 MB</td>
+</tr>
+<tr>
+<td>Descriptor templates (blocks per stage)</td>
+<td>{4, 4, 6, 8, 8}</td>
+<td>{2, 2, 2, 2, 2}</td>
+</tr>
+<tr>
+<td>Bottleneck</td>
+<td>8 transformer blocks at 1024 channels (q/k/v + FFN 4096)</td>
+<td>the same 8 blocks</td>
+</tr>
+<tr>
+<td>Registry entry</td>
+<td>310.8 <code>0x1800b0d80</code> (stride 0x288); 310.9.16 <code>0x1800dbe30</code> (stride 0x290)</td>
+<td>310.9.16 <code>0x1800dbe30 + 0x290</code></td>
+</tr>
+<tr>
+<td>Arch tag string</td>
+<td><code>CC_SILVER_AARDWOLD</code></td>
+<td><code>CC_SMALL_FP8</code></td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>Architecture.</strong> U-Net-style encoder/decoder: conv + windowed-attention (Swin, 1/2/4/8 heads at 32-256 ch) stages, split 16-head Swin at 512 ch, a 1024-ch ViT bottleneck, and a mirrored decoder. "Small" keeps the bottleneck and cuts the repeated blocks per stage.</li>
+<li><strong>Quantisation.</strong> The honest tench weights already look FP8-quantised (few distinct byte values in the large matrices). That fits "Quantize_With_Teacher": quantisation-aware training, no quantisation at load time.</li>
+<li><strong>Precision.</strong> Both runtimes append <code>_fp8</code> to every kernel name and set activation dtype 2 for both models (310.9.16 <code>FUN_1800572f0</code>; 310.8 <code>FUN_180032e20</code>).</li>
+<li><strong>Memory.</strong> The work pool is set by the runtime, not the model: 310.9.16 needs about 527 MB at 4K for either model, 310.8 needs 728 MB. By working scale, 310.8 / 310.9.16:</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>Scale</th>
+<th>310.8</th>
+<th>310.9.16</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0.875</td>
+<td>583 MB</td>
+<td>not logged</td>
+</tr>
+<tr>
+<td>0.75</td>
+<td>433 MB</td>
+<td>311 MB</td>
+</tr>
+<tr>
+<td>0.625</td>
+<td>310 MB</td>
+<td>222 MB</td>
+</tr>
+<tr>
+<td>0.5</td>
+<td>203 MB</td>
+<td>144 MB</td>
+</tr>
+<tr>
+<td>0.33</td>
+<td>86 MB</td>
+<td>62 MB</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>The same weights give the same picture.</strong> Preset 1 in 310.9.16 and 310.8 are the same weights. The pre-block parameter block differs only by the new 8-byte MaskBlendMode field (264 → 272 bytes); post-process and blend kernels have identical parameter layouts. In game, the two pictures differ only by the noise floor in all five scenes.</li>
+</ul>
+<p><strong>Registry entry layout</strong> (310.9.16; 310.8 is the same minus 8 bytes):</p>
+<table>
+<thead>
+<tr>
+<th>Offset</th>
+<th>Content</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>+0</td>
+<td>config name</td>
+</tr>
+<tr>
+<td>+8</td>
+<td>preset id</td>
+</tr>
+<tr>
+<td>+16</td>
+<td>resource name</td>
+</tr>
+<tr>
+<td>+24</td>
+<td>arch tag</td>
+</tr>
+<tr>
+<td>+0x20</td>
+<td>1 (tone/structure inputs, likely)</td>
+</tr>
+<tr>
+<td>+0x21</td>
+<td>1 (automask channel path, likely)</td>
+</tr>
+<tr>
+<td>+0x24</td>
+<td>15 (input channel layout, likely)</td>
+</tr>
+<tr>
+<td>+0x28</td>
+<td>1 (style conditioning, likely)</td>
+</tr>
+<tr>
+<td>+0x2c</td>
+<td>3 (style count, certain)</td>
+</tr>
+<tr>
+<td>from +0x38</td>
+<td>8 style-grade slots of 14 floats each</td>
+</tr>
+</tbody>
+</table>
+<h2>4. Every parameter the runtime reads</h2>
+<p>"Create" = read in CreateFeature (310.9.16 <code>FUN_180017b20</code>, 310.8 <code>FUN_180017e20</code>). "Eval" = read by the per-evaluation parser (310.9.16 <code>FUN_18001a020</code>, 310.8 <code>FUN_180019f30</code>). "v0.3.8" = what OptiScaler-NR v0.3.8 sends.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Read</th>
+<th>Default</th>
+<th>Values / range</th>
+<th>What it does</th>
+<th>310.8</th>
+<th>310.9.16</th>
+<th>v0.3.8</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CreationNodeMask, VisibilityNodeMask</td>
+<td>uint</td>
+<td>Create</td>
+<td>1</td>
+<td>node masks</td>
+<td>multi-GPU only</td>
+<td>yes</td>
+<td>yes</td>
+<td>1 / 1</td>
+</tr>
+<tr>
+<td>DLSSNR.Width / Height</td>
+<td>uint</td>
+<td>Create</td>
+<td>output size</td>
+<td>&gt; 0</td>
+<td>allocation size; the network runs at the active rect size and grows past this with a warning</td>
+<td>yes</td>
+<td>yes</td>
+<td>work size</td>
+</tr>
+<tr>
+<td>DLSSNR.Hint.Render.Preset</td>
+<td>uint (&amp; 0x7fffffff)</td>
+<td>Create</td>
+<td>0</td>
+<td>310.8: 1; 310.9.16: 1, 2</td>
+<td>picks the model; unknown values fall back to the shipping default (310.8: 1, 310.9.16: 2). Lookup: 310.9.16 <code>FUN_180023c20</code>, 310.8 <code>FUN_180023a40</code></td>
+<td>no effect (one model)</td>
+<td>1 = honest tench, 2 = small</td>
+<td>0 (→ 2)</td>
+</tr>
+<tr>
+<td>DLSSNR.Color</td>
+<td>resource</td>
+<td>Eval</td>
+<td>required</td>
+<td>display-referred RGB in [0,1]</td>
+<td>the picture to edit. Encoded (c - 0.5)/8; no exposure, sRGB, PQ or HDR handling; output always clamped to [0,1], alpha written as 1</td>
+<td>yes</td>
+<td>yes</td>
+<td>HUD-less picture</td>
+</tr>
+<tr>
+<td>DLSSNR.Output</td>
+<td>resource</td>
+<td>Eval</td>
+<td>required</td>
+<td>same size as Color</td>
+<td>result</td>
+<td>yes</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>DLSSNR.MVec + subrect</td>
+<td>resource</td>
+<td>Eval</td>
+<td>none</td>
+<td>pixel units × MVecScale / MVec size</td>
+<td>temporal history: previous network output fetched (Catmull-Rom) at uv + mv·scale/size; without MVec, or with Reset, history = current colour</td>
+<td>yes</td>
+<td>yes</td>
+<td>game's DLSS vectors</td>
+</tr>
+<tr>
+<td>DLSSNR.MVecScaleX / Y</td>
+<td>float</td>
+<td>Eval</td>
+<td>1.0</td>
+<td></td>
+<td>see MVec</td>
+<td>yes</td>
+<td>yes</td>
+<td>game's values</td>
+</tr>
+<tr>
+<td>DLSSNR.Depth + subrect</td>
+<td>resource</td>
+<td>Eval</td>
+<td>none</td>
+<td></td>
+<td><strong>not used.</strong> The pre-block kernel's depth slot is passed a literal 0 (310.9.16 l.26416)</td>
+<td>read, unused</td>
+<td>read, unused</td>
+<td>passed</td>
+</tr>
+<tr>
+<td>DLSSNR.DepthInverted</td>
+<td>uint</td>
+<td>Eval</td>
+<td>1</td>
+<td>0/1</td>
+<td><strong>no effect</strong> (only feeds dead depth code)</td>
+<td>yes</td>
+<td>yes</td>
+<td>passed</td>
+</tr>
+<tr>
+<td>DLSSNR.Intensity</td>
+<td>float</td>
+<td>Eval</td>
+<td>1.0</td>
+<td>effective 0..1</td>
+<td>final lerp: out = orig + sat(I [× mask.r]) · (NR − orig). <strong>Not a network input; &gt; 1 does nothing</strong></td>
+<td>yes</td>
+<td>yes</td>
+<td>1</td>
+</tr>
+<tr>
+<td>DLSSNR.LocalToneStrength</td>
+<td>float</td>
+<td>Eval</td>
+<td>1.0</td>
+<td><strong>unclamped</strong></td>
+<td>network input (channel 11, × ControlMask.g); also scales the style grade by clamp(tone, 0, 1)</td>
+<td>yes</td>
+<td>yes</td>
+<td>1</td>
+</tr>
+<tr>
+<td>DLSSNR.LocalStructureStrength</td>
+<td>float</td>
+<td>Eval</td>
+<td>1.0</td>
+<td><strong>unclamped</strong></td>
+<td>network input (channels 12-14)</td>
+<td>yes</td>
+<td>yes</td>
+<td>1</td>
+</tr>
+<tr>
+<td>DLSSNR.SkinStructureStrength</td>
+<td>float</td>
+<td>Eval</td>
+<td>-1</td>
+<td>-1 = follow structure; else unclamped</td>
+<td>skin structure (channel 13)</td>
+<td>yes</td>
+<td>yes</td>
+<td>-1</td>
+</tr>
+<tr>
+<td>DLSSNR.UseAutoMask</td>
+<td>uint</td>
+<td>Eval</td>
+<td>0</td>
+<td>0/1</td>
+<td>1: separate skin/structure channels (13, 14). 0: those are -1 and structure goes into channel 12. A ControlMask forces it to 0 (310.8 always; 310.9.16 only with MaskBlendMode 0)</td>
+<td>yes</td>
+<td>yes</td>
+<td>1</td>
+</tr>
+<tr>
+<td>DLSSNR.MaskBlendMode</td>
+<td>uint</td>
+<td>Eval</td>
+<td>0</td>
+<td>0..3 (&gt; 3 → 0)</td>
+<td><strong>new.</strong> With a ControlMask and AutoMask on: m = mask.b × structure is combined with the automatic skin/structure values, 1 average, 2 min, 3 max. 0 = the mask replaces AutoMask</td>
+<td>no</td>
+<td><strong>yes</strong></td>
+<td>not sent</td>
+</tr>
+<tr>
+<td>DLSSNR.ControlMask + subrect</td>
+<td>resource</td>
+<td>Eval</td>
+<td>none</td>
+<td>RGBA</td>
+<td>per-pixel controls: r = intensity, g = tone, b = structure, a unused (see controlmask.html)</td>
+<td>yes</td>
+<td>yes</td>
+<td>null</td>
+</tr>
+<tr>
+<td>DLSSNR.Style</td>
+<td>uint</td>
+<td>Eval</td>
+<td>0</td>
+<td>0, 1, 2 (≥ 3 → 2)</td>
+<td>network input (channel 10 = style/128) <strong>and</strong> a colour grade on the result, × clamp(tone, 0, 1): 0 = none; 1 = exposure −0.1 EV, contrast −0.25, saturation −10 %; 2 = saturation −15 %. A change resets history</td>
+<td>yes</td>
+<td>yes</td>
+<td>1</td>
+</tr>
+<tr>
+<td>DLSSNR.Reset</td>
+<td>uint</td>
+<td>Eval</td>
+<td>0</td>
+<td>0/1</td>
+<td>drops temporal history for this frame</td>
+<td>yes</td>
+<td>yes</td>
+<td>on first frame</td>
+</tr>
+<tr>
+<td>DLSSNR.Enabled</td>
+<td>uint</td>
+<td>Eval</td>
+<td>1</td>
+<td>0/1</td>
+<td>0 copies Backbuffer or Color straight to Output</td>
+<td>yes</td>
+<td>yes</td>
+<td>1</td>
+</tr>
+<tr>
+<td>DLSSNR.UICorrection</td>
+<td>uint</td>
+<td>Eval</td>
+<td>0</td>
+<td>0/1</td>
+<td>with UI/UIAlpha (+ Backbuffer): NR is faded under UI by (1 − alpha), result rebuilt on the Backbuffer. With a Backbuffer and no UI, the network runs on the Backbuffer</td>
+<td>yes</td>
+<td>yes</td>
+<td>1 (no UI given)</td>
+</tr>
+<tr>
+<td>DLSSNR.UI / UIAlpha / Backbuffer + subrects</td>
+<td>resource</td>
+<td>Eval</td>
+<td>none</td>
+<td></td>
+<td>see UICorrection; alpha = UIAlpha.r, else UI.a</td>
+<td>yes</td>
+<td>yes</td>
+<td>null</td>
+</tr>
+<tr>
+<td>DLSSNR.BidirectionalDistortionField + subrect</td>
+<td>resource</td>
+<td>Eval</td>
+<td>none</td>
+<td></td>
+<td><strong>no effect</strong> (one telemetry bit, l.20074)</td>
+<td>yes</td>
+<td>yes</td>
+<td>not sent</td>
+</tr>
+<tr>
+<td>DLSSNR.ScalingRatio</td>
+<td>float</td>
+<td>Eval (310.8) / never (310.9.16)</td>
+<td>1.0</td>
+<td></td>
+<td><strong>no effect.</strong> 310.8 reads it and overwrites it with 1.0; 310.9.16 never reads it. Only the ComputeScalingRatio callback writes it (310.9.16 <code>FUN_180012740</code>, 310.8 <code>FUN_180012e80</code>): PerfQualityValue 2/5 → 1.0, 4 → 0.85 (0x1800d9848), else error; 310.8 → 1.0 (0x1800ad684) for 0/1/2/4/5</td>
+<td>no effect</td>
+<td>no effect</td>
+<td>not sent</td>
+</tr>
+<tr>
+<td>DLSS.Indicator.Invert.X / Y.Axis</td>
+<td>uint</td>
+<td>Eval</td>
+<td>0</td>
+<td>0/1</td>
+<td>moves the on-screen indicator only</td>
+<td>yes</td>
+<td>yes</td>
+<td>not sent</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Evaluate parser struct P</strong> (310.9.16, 0x160 bytes):</p>
+<table>
+<thead>
+<tr>
+<th>Offset</th>
+<th>Field</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>+0</td>
+<td>Color</td>
+</tr>
+<tr>
+<td>+0x18</td>
+<td>MVec</td>
+</tr>
+<tr>
+<td>+0x30</td>
+<td>Depth</td>
+</tr>
+<tr>
+<td>+0x48</td>
+<td>Output</td>
+</tr>
+<tr>
+<td>+0x60</td>
+<td>ControlMask</td>
+</tr>
+<tr>
+<td>+0x78</td>
+<td>UI</td>
+</tr>
+<tr>
+<td>+0x90</td>
+<td>UIAlpha</td>
+</tr>
+<tr>
+<td>+0xa8</td>
+<td>Backbuffer</td>
+</tr>
+<tr>
+<td>+0xc0</td>
+<td>BDF</td>
+</tr>
+<tr>
+<td>+0xd8 / +0xdc</td>
+<td>MVecScale X / Y</td>
+</tr>
+<tr>
+<td>+0xe0</td>
+<td>Intensity</td>
+</tr>
+<tr>
+<td>+0xe4</td>
+<td>Tone</td>
+</tr>
+<tr>
+<td>+0xe8</td>
+<td>Structure</td>
+</tr>
+<tr>
+<td>+0xec</td>
+<td>Style</td>
+</tr>
+<tr>
+<td>+0xf0</td>
+<td>AutoMask</td>
+</tr>
+<tr>
+<td>+0xf4</td>
+<td>MaskBlendMode</td>
+</tr>
+<tr>
+<td>+0xf8</td>
+<td>Skin</td>
+</tr>
+<tr>
+<td>+0xfc / +0x100</td>
+<td>effective skin / structure (both −1.0 when AutoMask is off)</td>
+</tr>
+<tr>
+<td>+0x104</td>
+<td>Reset</td>
+</tr>
+<tr>
+<td>+0x108</td>
+<td>DepthInverted</td>
+</tr>
+<tr>
+<td>+0x10c</td>
+<td>Enabled</td>
+</tr>
+<tr>
+<td>+0x110</td>
+<td>UICorrection</td>
+</tr>
+<tr>
+<td>+0x114 / +0x118</td>
+<td>indicator invert X / Y</td>
+</tr>
+<tr>
+<td>+0x120</td>
+<td>downscale flag (always 0)</td>
+</tr>
+<tr>
+<td>+0x124</td>
+<td>scale (always 1.0, clamped to [0.5, 1.0] by the constants at 0x1800d9844 and 0x1800d877c)</td>
+</tr>
+<tr>
+<td>+0x128..+0x15c</td>
+<td>14-float grade vector</td>
+</tr>
+</tbody>
+</table>
+<h3>Network input, 16 channels per pixel (same layout in both versions)</h3>
+<p>Built by the pre-block parameter setup (310.9.16 <code>FUN_1800834b0</code>, called via <code>FUN_1800620c0</code> → <code>FUN_180083ee0</code>; pre-block PTX in the fatbin at 0x10e6d0, ~l.130-610 of the PTX):</p>
+<table>
+<thead>
+<tr>
+<th>Channel</th>
+<th>Content</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0-2</td>
+<td><strong>Gaussian noise</strong> (Box-Muller), seeded every frame from x, y and a frame counter: part of the "detail" is sampled</td>
+</tr>
+<tr>
+<td>3</td>
+<td>1.0</td>
+</tr>
+<tr>
+<td>4-6</td>
+<td>colour, encoded (c − 0.5) · 0.125</td>
+</tr>
+<tr>
+<td>7-9</td>
+<td>warped history (previous network output, Catmull-Rom)</td>
+</tr>
+<tr>
+<td>10</td>
+<td>Style / 128</td>
+</tr>
+<tr>
+<td>11</td>
+<td>Tone × ControlMask.g</td>
+</tr>
+<tr>
+<td>12</td>
+<td>AutoMask on: 1.0; off: structure × ControlMask.b</td>
+</tr>
+<tr>
+<td>13</td>
+<td>skin structure (AutoMask on), else −1</td>
+</tr>
+<tr>
+<td>14</td>
+<td>structure (AutoMask on), else −1</td>
+</tr>
+<tr>
+<td>15</td>
+<td>0</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Pre-block kernel parameters</strong> (272 bytes in 310.9.16, 264 in 310.8):</p>
+<table>
+<thead>
+<tr>
+<th>Offset</th>
+<th>Content</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>+0</td>
+<td>Color</td>
+</tr>
+<tr>
+<td>+8</td>
+<td>previous output</td>
+</tr>
+<tr>
+<td>+16</td>
+<td>MVec</td>
+</tr>
+<tr>
+<td>+24</td>
+<td>Depth (always 0)</td>
+</tr>
+<tr>
+<td>+32</td>
+<td>ControlMask</td>
+</tr>
+<tr>
+<td>+40</td>
+<td>MaskBlendMode (310.9.16)</td>
+</tr>
+<tr>
+<td>+164 / +168</td>
+<td>MVecScale ÷ MVec size</td>
+</tr>
+<tr>
+<td>+172</td>
+<td>DepthInverted</td>
+</tr>
+<tr>
+<td>+176</td>
+<td>Tone</td>
+</tr>
+<tr>
+<td>+180</td>
+<td>Structure</td>
+</tr>
+<tr>
+<td>+184</td>
+<td>Style/128</td>
+</tr>
+<tr>
+<td>+188 / +192</td>
+<td>effective skin / structure</td>
+</tr>
+<tr>
+<td>+196</td>
+<td>15</td>
+</tr>
+<tr>
+<td>+200</td>
+<td>registry +0x21</td>
+</tr>
+<tr>
+<td>+204</td>
+<td>0.0625</td>
+</tr>
+<tr>
+<td>+208</td>
+<td>frame counter</td>
+</tr>
+</tbody>
+</table>
+<p>The network output is a residual: x = enc(Color) + k·net, decoded as clamp(x·8 + 0.5, 0, 1), then blended with the warped history by a learned sigmoid weight (post-block PTX, ~l.13895-14125).</p>
+<p><strong>The final blend has two paths:</strong></p>
+<ul>
+<li><strong>Fused into the last network kernel:</strong> <code>..._simple_blend</code> (no mask), <code>..._control_mask</code>, plus <code>..._full_rect</code> variants when the rect is the whole texture. Picked by <code>FUN_18001d2e0</code>, rect test in <code>FUN_18001d660</code>. Used when the grade is the identity and there is no UI correction.</li>
+<li><strong><code>cg2r_post_process_kernel</code>:</strong> dispatched by <code>FUN_18001ca00</code> with 376 bytes of parameters. It handles the grade, UI correction, and the (dead) guided upsample.</li>
+</ul>
+<h2>5. Hidden and debug switches (complete list)</h2>
+<table>
+<thead>
+<tr>
+<th>Switch</th>
+<th>Where</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>env <code>__NGX_LOG_LEVEL</code>; registry <code>LogLevel</code>, <code>EnableConsoleLogging</code> (HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore)</td>
+<td>both (310.9.16 l.11377-11394)</td>
+<td>log level = max(registry, env, Init level). With 0, nothing is logged. Logging writes two lines per evaluation</td>
+</tr>
+<tr>
+<td>env <code>__NGX_ENABLE_OVERRIDE_LOG_PATH</code> + <code>__NGX_LOG_PATH_OVERRIDE</code>; registry <code>EnableLogPathOverride</code> + <code>LogPath</code></td>
+<td>both (l.5971-5991)</td>
+<td>log folder; files <code>nvngx_dlssnr_&lt;version&gt;.log</code></td>
+</tr>
+<tr>
+<td>registry <code>ShowDlssIndicator</code> = 0x400</td>
+<td>310.9.16 <code>FUN_18006ac20</code> (l.81091-81131), drawn by <code>FUN_18001c120</code></td>
+<td>overlay "DLSSNR v.. (default) on/off · W x H · active/alloc · weights: <name>"</td>
+</tr>
+<tr>
+<td>registry <code>ShowDlssWeights</code> (non-zero)</td>
+<td>310.9.16</td>
+<td>only the "weights: <name>" line; crazy cuckoo is shown as <strong>almond-eagle-11m</strong></td>
+</tr>
+<tr>
+<td>env <code>__NGX_SHOW_INDICATOR</code>, <code>__NGX_CUBIN_DISABLE_RESOURCE_CACHE</code>; registry <code>NgxCubinDisableResourceCache</code></td>
+<td>both (l.81120-81125)</td>
+<td>indicator; kernel cache</td>
+</tr>
+<tr>
+<td>export <code>NVSDK_NGX_SetRuntimeParamsCallback</code></td>
+<td>both</td>
+<td><strong>310.8:</strong> <code>NGXCG2R::PollRuntimeParams</code> (<code>FUN_18001ac30</code>), called from EvaluateFeature (<code>FUN_180018620</code>, l.19254 of the 310.8 export) after the parser, queries the callback with feature 0x12 and 8 entries of 24 bytes <code>{1, 2, id, present, double value}</code>. Ids: 0 Enabled → +0x108, 1 Tone → +0xe4, 2 Structure → +0xe8, 3 Intensity → +0xe0, 4 Style → +0xec, 5 AutoMask → +0xf0, 6 Skin/1000 → +0xf4, 7 scale/1000 → +0x120 (divisor 1000.0 at 0x1800afc30). The NGX core in the game never set it (logged: "callback is NULL (core did not set it)"). The scale override does nothing: the network size is hard-wired to the output size (<code>local_5d8 = 1.0</code>). <strong>310.9.16:</strong> the pointer is stored at 0x1804a0a80 and never read.</td>
+</tr>
+<tr>
+<td>weight files on disk, config files, forced presets, debug views, alternative kernels</td>
+<td>none in either version</td>
+<td>weights only come from the embedded resources</td>
+</tr>
+</tbody>
+</table>
+<h2>6. Runtime-side reduced resolution and guided upsample (dead code)</h2>
+<p>310.9.16 contains a complete reduced-resolution path (<code>local_816</code>, l.19225-19268 and 19819-19923):</p>
+<ul>
+<li>the network runs at floor(W·s + 0.5) × floor(H·s + 0.5);</li>
+<li>the full-resolution Color/Backbuffer is kept as the high source (copied to <code>dlssnr_guided_high_source_scratch</code>, RGBA16F, if it aliases the output);</li>
+<li>in <code>cg2r_post_process_kernel</code>, a 17×17×12-byte <code>transferTile</code> per 16×16 tile carries low-resolution deltas in Oklab (log-L ratio clamped ±2 and faded below L = 0.1, plus Δa/Δb), upsampled bilinearly onto the high source. That is the same idea as OptiScaler-NR's guided residual enlargement (Transfer 5), in Oklab and not edge-aware.</li>
+</ul>
+<p><strong>It is unreachable.</strong> P+0x124 is only written at parser initialisation (1.0, l.20203, disassembly 0x18001a12e) and clamped, so P+0x120 is always 0. <code>DLSSNR.ScalingRatio</code> is only written by the callback (l.14441) and never read. 310.8 ships the same <code>transferTile</code> code but also hard-wires the network size.</p>
+<h2>7. GPU architecture and precision</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>310.8</th>
+<th>310.9.16</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Arch accepted by CreateFeature</td>
+<td>0x190 (Ada) and 0x1B0 (Blackwell)</td>
+<td>0x1B0 only (error "Unsupported GPU architecture 0x%x, minimum required 0x%x")</td>
+</tr>
+<tr>
+<td>SASS / PTX shipped</td>
+<td>sm_89 + sm_120 / sm_120</td>
+<td>sm_120 / sm_120</td>
+</tr>
+<tr>
+<td>Kernel precision</td>
+<td>FP8 used (FP16 present, unused)</td>
+<td>FP8 only</td>
+</tr>
+<tr>
+<td>Kernel families</td>
+<td>Swin "tinlayout" fused blocks, split Swin 16-head 512 ch, ViT (2-D and 1-D token) 1024 ch, decoder upsample, CG2R post-process and copy</td>
+<td>same, plus <code>cc_vit_1d_*</code> / <code>mma-token1d-*</code> / <code>splitk-f16-*</code> for the small model</td>
+</tr>
+</tbody>
+</table>
+<h2>8. Key functions (Ghidra names, image base 0x180000000)</h2>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>310.9.16</th>
+<th>310.8</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NGXCG2R::CreateFeature (reads Width/Height/Preset, arch check)</td>
+<td><code>FUN_180017b20</code></td>
+<td><code>FUN_180017e20</code></td>
+</tr>
+<tr>
+<td>NGXCG2R::EvaluateFeature</td>
+<td><code>FUN_180018250</code></td>
+<td><code>FUN_180018620</code></td>
+</tr>
+<tr>
+<td>Evaluate parameter parser</td>
+<td><code>FUN_18001a020</code></td>
+<td><code>FUN_180019f30</code></td>
+</tr>
+<tr>
+<td>Reset temporal history on control change</td>
+<td><code>FUN_1800176c0</code></td>
+<td></td>
+</tr>
+<tr>
+<td>Create previous-output texture</td>
+<td><code>FUN_1800173b0</code></td>
+<td></td>
+</tr>
+<tr>
+<td>CG2RNetworkManager::CreateNetwork / ResolvePresetToDescriptor</td>
+<td><code>FUN_180021000</code></td>
+<td></td>
+</tr>
+<tr>
+<td>CG2RNetworkManager::Evaluate</td>
+<td><code>FUN_180021df0</code></td>
+<td></td>
+</tr>
+<tr>
+<td>CG2RFindWeightByPreset (fallback preset 2 / 1)</td>
+<td><code>FUN_180023c20</code></td>
+<td><code>FUN_180023a40</code></td>
+</tr>
+<tr>
+<td>Weight registry lookup by name</td>
+<td><code>FUN_180023b80</code></td>
+<td><code>FUN_1800239a0</code></td>
+</tr>
+<tr>
+<td>CG2RLoadWeightBlob (FindResourceA type 10)</td>
+<td><code>FUN_180023ca0</code></td>
+<td><code>FUN_180023ac0</code></td>
+</tr>
+<tr>
+<td>Descriptor list builder</td>
+<td><code>FUN_1800602e0</code></td>
+<td><code>FUN_18003d670</code></td>
+</tr>
+<tr>
+<td>Backbone/template builder</td>
+<td><code>FUN_18005c5a0</code></td>
+<td><code>FUN_180039780</code></td>
+</tr>
+<tr>
+<td>Convert to FP8 kernels</td>
+<td><code>FUN_1800572f0</code></td>
+<td><code>FUN_180032e20</code></td>
+</tr>
+<tr>
+<td>Style grade lookup / write</td>
+<td><code>FUN_18001d8a0</code> / <code>FUN_18001d6d0</code></td>
+<td></td>
+</tr>
+<tr>
+<td>Fused blend mode select</td>
+<td><code>FUN_18001d2e0</code></td>
+<td></td>
+</tr>
+<tr>
+<td>Post-process dispatch</td>
+<td><code>FUN_18001ca00</code></td>
+<td></td>
+</tr>
+<tr>
+<td>Pre-block parameters</td>
+<td><code>FUN_1800834b0</code></td>
+<td></td>
+</tr>
+<tr>
+<td>Indicator text / registry read</td>
+<td><code>FUN_18001c120</code> / <code>FUN_18006ac20</code></td>
+<td></td>
+</tr>
+<tr>
+<td>ComputeScalingRatio callback</td>
+<td><code>FUN_180012740</code></td>
+<td><code>FUN_180012e80</code></td>
+</tr>
+<tr>
+<td>PollRuntimeParams</td>
+<td>(removed)</td>
+<td><code>FUN_18001ac30</code></td>
+</tr>
+<tr>
+<td>Log sink / log init</td>
+<td><code>FUN_18000df60</code> / the function around l.11290</td>
+<td></td>
+</tr>
+<tr>
+<td>Weight registry table</td>
+<td><code>0x1800dbe30</code>, 2 × 0x290</td>
+<td><code>0x1800b0d80</code>, 1 × 0x288</td>
+</tr>
+</tbody>
+</table>
+<p>Useful constants (310.9.16):</p>
+<table>
+<thead>
+<tr>
+<th>Address</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0x1800d9844</td>
+<td>0.5</td>
+</tr>
+<tr>
+<td>0x1800d877c</td>
+<td>1.0</td>
+</tr>
+<tr>
+<td>0x1800d9848</td>
+<td>0.85</td>
+</tr>
+<tr>
+<td>0x1800dad8c</td>
+<td>0.9999</td>
+</tr>
+<tr>
+<td>0x1800dad98</td>
+<td>−1.0</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>Appendix A: 310.9.16 parameter trace (line numbers = full decompile export)</h2>
+<p>Line numbers refer to the full 310.9.16 decompile export unless noted. "PTX" = cg2r_post_process_kernel (fatbin at file offset 0x47d340); "pre/post PTX" = the fused pre/post-block kernels (fatbin at file offset 0x10e6d0); PTX line numbers count from the start of that PTX text. CERTAIN = seen in code/data; LIKELY = inferred.</p>
+<h3>Corrections</h3>
+<ul>
+<li>FUN_1800176c0 is called (state, mgr, &amp;P) (l.19403); the first arg is the per-feature state (featureNode+8). Offsets +0x170.. are relative to that state. It does not compare Intensity. CERTAIN.</li>
+<li>P is 0x160 bytes; P+0x128..+0x15c = 14-float colour-grade vector; P+0x11c never written. CERTAIN.</li>
+</ul>
+<h3>Q1 Style</h3>
+<ul>
+<li>Read unclamped into P+0xec (l.20519-20525); EvaluateFeature clamps with an unsigned compare against the descriptor style count = 3 (registry entry +0x2c): Style &gt;= 3 -&gt; 2 (negative also -&gt; 2) (l.19388-19394; FUN_18001f640 l.24188; again FUN_180021df0 l.26376-26385). CERTAIN.</li>
+<li>Network input: Style/128 -&gt; pre-block kernel param +184 -&gt; constant input channel 10 (l.26414 -&gt; FUN_1800620c0 l.75030 -&gt; FUN_180083ee0 -&gt; FUN_1800834b0 l.99528; pre PTX l.80-82,168). Both registry entries enable it (+0x28 = 1). CERTAIN.</li>
+<li>Also selects a colour grade: FUN_18001d8a0 (l.22743) looks up the style in 8 slots per registry entry; FUN_18001d6d0 (l.22679) writes value x clamp(LocalToneStrength,0,1) into P+0x128..; applied in cg2r_post_process_kernel. Data (CERTAIN):<ul>
+<li>Style 0: no grade</li>
+<li>Style 1: exposure -0.1 EV, contrast -0.25 (flatter), saturation -10 %</li>
+<li>Style 2: saturation -15 %</li>
+<li>slots 3-8 empty; nothing hidden selectable.</li>
+</ul>
+</li>
+<li>Grade engine has 14 controls (params +316..+371, host l.22327-22334; order from PTX l.720-1372): black point, white point, temperature, tint, exposure 2^v, contrast (smoothstep S-curve), 5-band per-channel tone curve, gamma c^(2^-v), HSL saturation x(1+v), saturation curve s^(2^-v). The styles use only three. Not reachable through parameters.</li>
+<li>An active grade forces the post-process pass (output clamped [0,1], alpha 1, fused blend off). A Style change resets temporal history.</li>
+</ul>
+<h3>Q2 Strengths</h3>
+<p>Pre-block params (FUN_1800834b0, 272 B): 0 Color; 8 previous network output (history); 16 MVec; 24 Depth = always 0 (literal, l.26416); 32 ControlMask; 40 MaskBlendMode; 164/168 MVecScale / MVec size; 172 DepthInverted; 176 LocalTone (raw); 180 LocalStructure (raw); 184 Style/128; 188/192 effective skin / effective structure; 196 = 15 (registry +0x24); 200 registry +0x21; 204 0.0625; 208 frame counter (noise seed). CERTAIN.</p>
+<p>Input channels per pixel (pre PTX l.130-610), CERTAIN:
+| ch | content |
+|---|---|
+| 0-2 | Gaussian noise (Box-Muller, seeded by x, y, frame) |
+| 3 | 1.0 |
+| 4-6 | colour, encoded (c-0.5)<em>0.125 |
+| 7-9 | history: Catmull-Rom at uv + mv</em>scale/size; copy of colour if no MVec / no valid history / Reset |
+| 10 | Style/128 |
+| 11 | Tone x mask.g |
+| 12 | AutoMask on: 1.0; off: structure x mask.b |
+| 13 | skin (or structure if skin &lt; 0); -1 when AutoMask off |
+| 14 | structure; -1 when AutoMask off |
+| 15 | 0 |</p>
+<ul>
+<li>Tone/structure are conditioning inputs (not a frequency split), not clamped. CERTAIN.</li>
+<li>MaskBlendMode acts only with ControlMask + AutoMask on + mode != 0: m = mask.b x structure into ch 13/14: 1 average, 2 min, 3 max. CERTAIN.</li>
+<li>Output is a residual: x = enc(Color) + k<em>net, decoded clamp(x</em>8+0.5,0,1), blended with history by a learned sigmoid weight (post PTX l.13895-14125). Math CERTAIN, meaning LIKELY.</li>
+<li>Intensity is never a network input. Blend only when Intensity &lt; 1, ControlMask, grade, or UICorrection with UI (l.19478). Intensity &gt; 1 does nothing.<ul>
+<li>Fused blend in the last network kernel (FUN_18001d2e0 l.22490): _simple_blend (no mask), _control_mask (mask), _full_rect variants when the rect is the whole texture (FUN_18001d660). Needs identity grade and no UICorrection+UI. out = sat(orig + sat(I [x mask.r])*(net-orig)). CERTAIN.</li>
+<li>cg2r_post_process_kernel (FUN_18001ca00 l.21961): out = sat(orig + sat(I<em>mask.r</em>(1-uiAlpha))*(graded-base)) (PTX l.1375-2095). CERTAIN.</li>
+<li>=&gt; Intensity is effectively [0,1], a plain lerp. ControlMask: r = intensity, g = tone, b = structure, a unused.</li>
+</ul>
+</li>
+</ul>
+<h3>Q3 Working scale</h3>
+<ul>
+<li>P+0x124 is only written at parser init (1.0) and clamped; P+0x120 always 0. No NGX parameter feeds it. DLSSNR.ScalingRatio is only written by the callback (l.14441), never read. CreateFeature uses W x H at scale 1.0. CERTAIN.</li>
+<li>The downscale + guided path (l.19225-19268, 19819-19923) is dead code. It would run the network at floor(W<em>s+0.5) x floor(H</em>s+0.5), use full-res Color/Backbuffer as high source, and in the post-process kernel build a 17x17 transferTile per 16x16 tile of low-res deltas in Oklab (log-L ratio clamped +-2, faded below L = 0.1, plus da/db), upsampled bilinearly onto the high source: like the fork's Transfer=5 in Oklab, not edge-aware.</li>
+<li>Implication: keep downscale + guided enlargement on the app side.</li>
+</ul>
+<h3>Q4 Inputs</h3>
+<ul>
+<li>Required: Color and Output (else skipped, 0xbad00005, l.19116).</li>
+<li>Colour: display-referred [0,1] only; no exposure input, no sRGB/PQ/HDR handling; output clamped [0,1]; alpha always 1. CERTAIN.</li>
+<li>MVec: needed for temporal history with valid history and Reset=0 (l.26151); uv_prev = uv + mv*MVecScale/size.</li>
+<li>Depth: never bound (literal 0) -&gt; DepthInverted no effect. CERTAIN.</li>
+<li>BidirectionalDistortionField: only sets a telemetry bit (l.20074). CERTAIN.</li>
+<li>UICorrection + UI/UIAlpha + Backbuffer: out = Backbuffer + w*(graded(net) - Color), w x (1 - alpha), alpha = UIAlpha.r else UI.a. With UICorrection + Backbuffer but no UI/UIAlpha the network runs on the Backbuffer (l.19471). Without Backbuffer NR is suppressed under UI.</li>
+<li>Enabled=0: copies Backbuffer or Color to Output (l.19423).</li>
+<li>Rects: Color and Output same size (except full-texture Output with a Color subrect inside, l.19141-19211). Network runs at active size. Limits: non-zero sizes, buffer pool &lt; 4 GB; LIKELY no alignment need.</li>
+</ul>
+<h3>Q5 Hidden switches</h3>
+<ul>
+<li>Registry HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore: ShowDlssIndicator (only 0x400: full overlay), ShowDlssWeights (non-zero: "weights: <name>", crazy-cuckoo shown as almond-eagle-11m). FUN_18006ac20 l.81091-81131, drawn FUN_18001c120. CERTAIN.</li>
+<li>Registry NgxCubinDisableResourceCache; env __NGX_SHOW_INDICATOR, __NGX_CUBIN_DISABLE_RESOURCE_CACHE (l.81120-81125).</li>
+<li>Registry LogLevel, EnableConsoleLogging; env __NGX_LOG_LEVEL (l.11377-11394). Registry EnableLogPathOverride, LogPath; env __NGX_ENABLE_OVERRIDE_LOG_PATH, __NGX_LOG_PATH_OVERRIDE (l.5971-5991).</li>
+<li>DLSS.Indicator.Invert.X/Y.Axis only move the overlay.</li>
+<li>SetRuntimeParamsCallback stores a pointer that nothing reads: dead (310.8 PollRuntimeParams gone). CERTAIN.</li>
+<li>No config/weights files, no forced presets, no alternative kernels. cuda_capture_* kernels have no NR caller. CERTAIN.</li>
+</ul>
+<h3>Q6 Preset 1 in FP8</h3>
+<ul>
+<li>FUN_1800602e0 builds both descriptors (templates {4,4,6,8,8} honest_tench, {2,2,2,2,2} crazy-cuckoo, LIKELY per-stage block counts); FUN_1800572f0 appends _fp8 to every kernel name and sets activation dtype 2 for both. 310.8 did the same for honest_tench (FUN_180032e20, line 45667 of the 310.8 export): preset 1 already ran FP8 in 310.8. CERTAIN.</li>
+<li>No quantization at load (bytes copied). WEIGHTS_HT already looks FP8-quantized (few distinct byte values), consistent with "Quantize_With_Teacher" QAT. LIKELY.</li>
+<li>Factory accepts only backbone "CCNetwork" (l.75151). CERTAIN.</li>
+<li>Registry bytes +0x20..+0x2f (same in both): +0x20 = 1 tone/structure inputs (LIKELY), +0x21 = 1 automask path (LIKELY), +0x24 = 15 input layout (LIKELY), +0x28 = 1 style conditioning (LIKELY), +0x2c = 3 style count (CERTAIN).</li>
+<li>0/auto/unknown preset -&gt; preset 2 (FUN_180023c20 l.27403).</li>
+</ul>
+<h2>Appendix B: what OptiScaler-NR v0.3.8 does not send, and what the tests showed</h2>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Preset 1 on 310.9.16</td>
+<td>the old model inside the new runtime: the same picture as 310.8, about 3 % faster than 310.8, about 70 % more GPU time than preset 2</td>
+</tr>
+<tr>
+<td>ControlMask + MaskBlendMode</td>
+<td>works exactly as traced; see <a href="controlmask.html">controlmask.html</a></td>
+</tr>
+<tr>
+<td>Tone / Structure / Skin above 2</td>
+<td>unclamped network inputs; Structure 4 breaks the small model's picture (+60 brightness, heavy flicker)</td>
+</tr>
+<tr>
+<td>Style 0</td>
+<td>removes the built-in grade: visibly more colour and contrast than Style 1</td>
+</tr>
+<tr>
+<td>Depth, DepthInverted, BidirectionalDistortionField, ScalingRatio, Intensity &gt; 1</td>
+<td>no effect in either version</td>
+</tr>
+</tbody>
+</table>
+</main></body></html>

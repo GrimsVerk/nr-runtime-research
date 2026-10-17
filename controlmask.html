@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NR ControlMask</title><style>:root{--bg:#f6f5f2;--card:#fff;--ink:#1d1d1f;--muted:#6b6b70;--line:#e2e0db;--accent:#2d5fd3}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#141416;--card:#1d1d21;--ink:#ecebe8;--muted:#9a99a0;--line:#303036;--accent:#6f97ff}}
+:root[data-theme="dark"]{--bg:#141416;--card:#1d1d21;--ink:#ecebe8;--muted:#9a99a0;--line:#303036;--accent:#6f97ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1200px;margin:0 auto;padding:24px 16px 60px}a{color:var(--accent)}
+h1{font-size:26px;margin:0 0 8px}h2{font-size:19px;margin:28px 0 8px;padding-top:8px;border-top:1px solid var(--line)}h3{font-size:16px;margin:18px 0 6px}
+table{border-collapse:collapse;width:100%;font-size:13.5px;margin:8px 0 14px;display:block;overflow-x:auto}
+td,th{padding:5px 8px;border:1px solid var(--line);vertical-align:top;text-align:left}th{background:var(--card)}
+code{font-size:12.5px;background:var(--card);padding:1px 5px;border-radius:5px;border:1px solid var(--line);word-break:break-word}
+pre{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px;overflow-x:auto}pre code{border:0;padding:0}
+li{margin:3px 0}hr{border:0;border-top:2px solid var(--line);margin:30px 0}</style></head><body><main>
+<h1>ControlMask: per-pixel control of NVIDIA NR</h1>
+<p><a href="index.html">Back to the report</a> · <a href="static.html">Static analysis</a> · <a href="noisy-domain.html">Noisy-domain NR feasibility</a></p>
+<p><strong>Written by Claude Opus 5.5 (Claude Code, high effort) on behalf of GrimsVerk, who skimmed it. The research, the test-build code changes, the measurements and this text are Claude's work.</strong></p>
+<h2>What the runtime does with it</h2>
+<p><code>DLSSNR.ControlMask</code> (+ <code>ControlMaskSubrectBase/Width/Height</code>) is read at every evaluation, in both 310.8 and 310.9.16. Per pixel:</p>
+<table>
+<thead>
+<tr>
+<th>Channel</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>r</strong></td>
+<td>intensity: the final blend becomes out = orig + sat(Intensity × mask.r) · (NR − orig)</td>
+</tr>
+<tr>
+<td><strong>g</strong></td>
+<td>tone: network input channel 11 = LocalTone × mask.g. The Style colour grade is <em>not</em> scaled by it (the grade uses clamp(LocalTone, 0, 1))</td>
+</tr>
+<tr>
+<td><strong>b</strong></td>
+<td>structure: AutoMask off → channel 12 = structure × mask.b; AutoMask on → see MaskBlendMode</td>
+</tr>
+<tr>
+<td><strong>a</strong></td>
+<td>unused</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Interaction with NVIDIA's automatic skin/structure mask (AutoMask):</strong></p>
+<ul>
+<li><strong>310.8:</strong> any ControlMask forces AutoMask off.</li>
+<li><strong>310.9.16:</strong> <code>DLSSNR.MaskBlendMode</code>.<ul>
+<li><strong>0</strong>: as in 310.8, AutoMask off.</li>
+<li><strong>1 / 2 / 3</strong>: AutoMask stays on, and m = mask.b × structure is combined with NVIDIA's skin (channel 13) and structure (channel 14) values by <strong>average / min / max</strong>.</li>
+</ul>
+</li>
+</ul>
+<p>With a mask present, the runtime uses the <code>..._control_mask</code> variants of the fused final kernel (<code>..._full_rect</code> when the subrect covers the whole texture). See the <a href="static.html">static analysis</a>, section 4.</p>
+<h2>How the research build makes the mask</h2>
+<p>The research build is based on <a href="https://github.com/GrimsVerk/OptiScaler-DLSSNR-PreSR-Multipass">GrimsVerk's OptiScaler-NR fork</a> v0.3.8, commit ac313d06; the source is in <code>research-build-source.patch</code>.</p>
+<ul>
+<li><strong>Where:</strong> a new mode (14) of the fork's NR compute shader writes an RGBA8 mask at the model's working size every frame, right before NVIDIA's evaluate. The mask is passed with a full-texture subrect; null when the mask is off.</li>
+<li><strong>Inputs:</strong><ul>
+<li>t0 = the picture the model gets;</li>
+<li>t2 = the game's depth (guide resolution);</li>
+<li>t3 = the motion vectors.</li>
+</ul>
+</li>
+<li><strong>Rules,</strong> applied in order on top of a base value:<ol>
+<li><strong>Far / sky</strong>: a soft weight, full at depth ≤ margin and zero at 2 × margin (reversed depth; mirrored for ordinary depth). It is averaged over 5×5 depth texels so silhouettes do not flicker with the per-frame jitter. Blends the base towards the far values.</li>
+<li><strong>Dark</strong>: below "dark start" brightness (fully at "dark full"), r and b fade towards the dark values.</li>
+<li><strong>Motion</strong>: between "motion start" and "motion full" pixels per frame (at the model's size), r and b fade towards the motion values.</li>
+</ol>
+</li>
+<li><strong>Cost:</strong> +0.13 ms at 4K output with the small model (mask build + NVIDIA's mask kernel variant, measured inside the model timer: 7.26 vs 7.13 ms).</li>
+</ul>
+<h2>Settings (OptiScaler.ini, section [DlssNr])</h2>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Values</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ControlMask</code></td>
+<td>true / false</td>
+<td>build and send the mask (D3D12 path; off in spatial-compression mode)</td>
+</tr>
+<tr>
+<td><code>MaskBlendMode</code></td>
+<td>0-3</td>
+<td>see above. <strong>2 recommended</strong>: NVIDIA's skin handling stays; the mask can only lower structure</td>
+</tr>
+<tr>
+<td><code>ControlMaskParams</code></td>
+<td>16 numbers</td>
+<td>see below</td>
+</tr>
+</tbody>
+</table>
+<p><code>ControlMaskParams</code> order, in four groups of four:</p>
+<table>
+<thead>
+<tr>
+<th>Group</th>
+<th>The four numbers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>base r, base g, base b, (unused; the depth direction is filled in automatically)</td>
+</tr>
+<tr>
+<td>2</td>
+<td>far r, far g, far b, far margin (0 = off; 0.00001 = sky only in reversed-depth games; 0.001 = also distant scenery)</td>
+</tr>
+<tr>
+<td>3</td>
+<td>dark start, dark full (brightness 0-1, start &gt; full), dark r, dark b</td>
+</tr>
+<tr>
+<td>4</td>
+<td>motion start, motion full (pixels per frame at the model's size, full &gt; start), motion r, motion b</td>
+</tr>
+</tbody>
+</table>
+<p>The default <code>1,1,1,0, 1,1,1,0, 0,0,1,1, 0,0,1,1</code> changes nothing. The same values are available as live test-control keys (<code>ControlMask</code>, <code>MaskBlendMode</code>, <code>MaskParam0</code>…<code>MaskParam15</code>) when <code>HudlessTestControl = true</code>. When the mask is created, OptiScaler.log shows a line <code>DLSS-NR control mask WxH: base …, far … margin …, dark …, motion …, MaskBlendMode …</code>.</p>
+<p><strong>Example, keep the game's own sky:</strong></p>
+<pre><code>ControlMask = true
+MaskBlendMode = 2
+ControlMaskParams = 1,1,1,0, 0,1,1,0.00001, 0,0,1,1, 0,0,1,1
+</code></pre>
+<p><strong>Example, less NR and structure in the darks:</strong> <code>ControlMaskParams = 1,1,1,0, 1,1,1,0, 0.20,0.04,0.4,0.5, 0,0,1,1</code></p>
+<h2>Proof (The Witcher 3, frozen photo-mode frames)</h2>
+<p>Each value is the mean |difference|, in 8-bit units, between the two captures named in the first column. The "noise floor" row is the same setting captured twice.</p>
+<table>
+<thead>
+<tr>
+<th>Comparison</th>
+<th>Courtyard 310.9.16</th>
+<th>Yennefer 310.9.16</th>
+<th>Courtyard 310.8</th>
+<th>Yennefer 310.8</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>def_end vs def</td>
+<td>2.03</td>
+<td>1.41</td>
+<td>1.55</td>
+<td>1.37</td>
+<td>noise floor (same setting twice)</td>
+</tr>
+<tr>
+<td>m1_b0 vs def</td>
+<td>2.04</td>
+<td>1.49</td>
+<td>1.62</td>
+<td>1.50</td>
+<td>all-ones mask, MaskBlendMode 0: no visible change</td>
+</tr>
+<tr>
+<td>m1_b2 vs def</td>
+<td>2.03</td>
+<td>1.41</td>
+<td>-</td>
+<td>-</td>
+<td>all-ones mask, MaskBlendMode 2 (min): no change</td>
+</tr>
+<tr>
+<td>mr05 vs int05</td>
+<td>1.57</td>
+<td>1.36</td>
+<td>1.47</td>
+<td>1.41</td>
+<td>red = 0.5 is the same as Intensity 0.5</td>
+</tr>
+<tr>
+<td>mr0 vs def</td>
+<td>7.63</td>
+<td>7.61</td>
+<td>-</td>
+<td>-</td>
+<td>red = 0: NR fully off where the mask says so</td>
+</tr>
+<tr>
+<td>mb0_b0 vs str0</td>
+<td>1.44</td>
+<td>1.42</td>
+<td>-</td>
+<td>-</td>
+<td>blue = 0 (blend 0) is the same as Local structure 0</td>
+</tr>
+<tr>
+<td>mb0_b1 vs def</td>
+<td>3.04</td>
+<td>2.13</td>
+<td>-</td>
+<td>-</td>
+<td>blue = 0, blend 1 (average with NVIDIA's skin/structure mask): half the effect</td>
+</tr>
+<tr>
+<td>mb0_b3 vs def</td>
+<td>2.03</td>
+<td>1.41</td>
+<td>-</td>
+<td>-</td>
+<td>blue = 0, blend 3 (max): no change, NVIDIA's own value wins</td>
+</tr>
+<tr>
+<td>mg0 vs def</td>
+<td>4.89</td>
+<td>3.48</td>
+<td>5.84</td>
+<td>4.65</td>
+<td>green = 0: tone input off; the style grade stays (unlike Local tone 0)</td>
+</tr>
+<tr>
+<td>mg05 vs tone05</td>
+<td>2.37</td>
+<td>2.87</td>
+<td>-</td>
+<td>-</td>
+<td>green = 0.5 against Local tone 0.5: close, not identical (grade)</td>
+</tr>
+<tr>
+<td>mdark vs def</td>
+<td>2.50</td>
+<td>2.17</td>
+<td>-</td>
+<td>-</td>
+<td>dark rule (less intensity/structure in the darks)</td>
+</tr>
+<tr>
+<td>tone05 vs def</td>
+<td>3.65</td>
+<td>3.25</td>
+<td>-</td>
+<td>-</td>
+<td>for reference: Local tone 0.5 (no mask) against 1</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Sky rule (terrace frame with a large sky):</strong></p>
+<ul>
+<li><strong>Edit maps:</strong> NR's edit in the sky area drops to nothing; a margin of 0.001 also removes it from everything beyond the terrace wall.</li>
+<li><strong>Flicker:</strong> the first hard-edged version raised frame-to-frame flicker from 0.22 to 0.28. The soft 5×5 version brings it to 0.212 against 0.204 without a mask.</li>
+<li><strong>WorkingScale 0.5</strong> (from the INI only): the edit in the top third of the frame dropped from 12.3 to 4.8; the rest is mountains and a tree.</li>
+</ul>
+<p>Pictures are in the ControlMask section of the <a href="index.html">report</a>.</p>
+<h2>Caveats</h2>
+<ul>
+<li><strong>The motion rule is untested,</strong> because photo mode has no motion.</li>
+<li><strong>The mask is 8-bit,</strong> and it multiplies the global Intensity, Tone and Structure settings rather than replacing them.</li>
+<li><strong>310.8</strong> has no MaskBlendMode, so any mask there switches AutoMask off; for an all-ones mask, the measured effect is at the noise floor.</li>
+</ul>
+</main></body></html>

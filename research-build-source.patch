@@ -1,0 +1,476 @@
+diff --git a/OptiScaler/Config.cpp b/OptiScaler/Config.cpp
+index 72840802..c540e4db 100644
+--- a/OptiScaler/Config.cpp
++++ b/OptiScaler/Config.cpp
+@@ -9,6 +9,8 @@
+ #include <misc/IdentifyGpu.h>
+ 
+ #include <SimpleIni.h>
++#include <algorithm>
++#include <sstream>
+ 
+ static CSimpleIniA ini;
+ 
+@@ -427,6 +429,19 @@ bool Config::Reload(std::filesystem::path iniPath)
+             DlssNrShowSkinMask.set_from_config(readBool("DlssNr", "ShowSkinMask"));
+             DlssNrUnlockPasses.set_from_config(readBool("DlssNr", "UnlockPasses"));
+             DlssNrUnlockStrengths.set_from_config(readBool("DlssNr", "UnlockStrengths"));
++            // Research build: NVIDIA ControlMask built by the fork, and how it mixes with NVIDIA's own skin mask.
++            DlssNrControlMask.set_from_config(readBool("DlssNr", "ControlMask"));
++            DlssNrMaskBlendMode.set_from_config(readUInt("DlssNr", "MaskBlendMode"));
++            if (auto params = readString("DlssNr", "ControlMaskParams"); params.has_value())
++            {
++                // 16 numbers, comma or space separated, in the order documented in Config.h.
++                std::string text = *params;
++                std::replace(text.begin(), text.end(), ',', ' ');
++                std::istringstream values(text);
++                float value = 0.0f;
++                for (unsigned int i = 0; i < 16 && (values >> value); ++i)
++                    DlssNrMaskParams[i] = value;
++            }
+             for (unsigned int i = 0; i < std::size(DlssNrPassOverrides); ++i)
+             {
+                 auto& pass = DlssNrPassOverrides[i];
+diff --git a/OptiScaler/Config.h b/OptiScaler/Config.h
+index 2a49148f..7d805b7e 100644
+--- a/OptiScaler/Config.h
++++ b/OptiScaler/Config.h
+@@ -333,6 +333,19 @@ class Config
+     CustomOptional<bool> DlssNrUnlockPasses { false };
+     // Model inputs (intensity, local structure/tone, skin structure) beyond 0-2: sliders to 10, typed values kept.
+     CustomOptional<bool> DlssNrUnlockStrengths { false };
++    // Runtime research build (live test control only): DLSSNR.MaskBlendMode (read by 310.9+, 0..3), preset/style
++    // passed unclamped, and how often the GPU timing window is logged.
++    CustomOptional<uint32_t> DlssNrMaskBlendMode { 0 };
++    CustomOptional<bool> DlssNrRawModel { false };
++    CustomOptional<uint32_t> DlssNrGpuLogFrames { 600 };
++    // 0 = NR through the NVIDIA driver (normal); 1..9 = load the runtime file named on line N of nr-runtimes.txt
++    // next to this DLL directly (compatibility path), so two runtime versions can be compared in one session.
++    CustomOptional<uint32_t> DlssNrRuntimeSlot { 0 };
++    // Per-pixel NVIDIA ControlMask built by the fork (r intensity, g tone, b structure). Parameters, in order:
++    // base r g b, (unused), sky r g b, sky depth margin (0 = off), dark start/full luma, dark r, dark b,
++    // motion start/full (model pixels), motion r, motion b. See DlssNrMode_ControlMask.
++    CustomOptional<bool> DlssNrControlMask { false };
++    float DlssNrMaskParams[16] = { 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1 };
+     // Passes 2..30 inherit pass 1, except LocalTone defaults to zero.
+     struct NrPassOverrides
+     {
+diff --git a/OptiScaler/dllmain.cpp b/OptiScaler/dllmain.cpp
+index 729e01db..063570cb 100644
+--- a/OptiScaler/dllmain.cpp
++++ b/OptiScaler/dllmain.cpp
+@@ -1,4 +1,6 @@
+ #include "pch.h"
++#include <fstream>
++#include <filesystem>
+ #include "dllmain.h"
+ 
+ #include "Util.h"
+@@ -1775,6 +1777,25 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
+     {
+         DisableThreadLibraryCalls(hModule);
+ 
++        // Runtime research build: nr-ngx-log.txt next to this DLL ("level" on line 1, optional log folder on
++        // line 2) turns on NVIDIA's own NGX/NR runtime logging for this process only (environment variables).
++        {
++            wchar_t self[MAX_PATH] {};
++            GetModuleFileNameW(hModule, self, MAX_PATH);
++            std::filesystem::path switchFile = std::filesystem::path(self).parent_path() / L"nr-ngx-log.txt";
++            std::wifstream in(switchFile);
++            std::wstring level, folder;
++            if (in && std::getline(in, level) && !level.empty())
++            {
++                SetEnvironmentVariableW(L"__NGX_LOG_LEVEL", level.c_str());
++                if (std::getline(in, folder) && !folder.empty())
++                {
++                    SetEnvironmentVariableW(L"__NGX_ENABLE_OVERRIDE_LOG_PATH", L"1");
++                    SetEnvironmentVariableW(L"__NGX_LOG_PATH_OVERRIDE", folder.c_str());
++                }
++            }
++        }
++
+         HMODULE handle = nullptr;
+         OSVERSIONINFOW winVer { 0 };
+ 
+diff --git a/OptiScaler/dlssnr/DlssNr_HudlessTest.h b/OptiScaler/dlssnr/DlssNr_HudlessTest.h
+index 7061d5df..c4ee5769 100644
+--- a/OptiScaler/dlssnr/DlssNr_HudlessTest.h
++++ b/OptiScaler/dlssnr/DlssNr_HudlessTest.h
+@@ -9,6 +9,7 @@
+ // Nothing here runs unless the INI switch is on.
+ 
+ #include <Config.h>
++#include "DlssNr_Status.h"
+ #include <Util.h>
+ #include <d3d12.h>
+ #include <wrl/client.h>
+@@ -175,6 +176,35 @@ class Harness
+                 cfg.DlssNrUnlockStrengths = number() != 0;
+             else if (key == "Intensity")
+                 cfg.DlssNrIntensity = number();
++            else if (key == "Preset") // research build: NR feature is recreated on change
++                cfg.DlssNrPreset = (uint32_t) std::strtoul(value.c_str(), nullptr, 0);
++            else if (key == "Style")
++                cfg.DlssNrStyle = (uint32_t) std::strtoul(value.c_str(), nullptr, 0);
++            else if (key == "SkinStructure")
++                cfg.DlssNrSkinStructure = number();
++            else if (key == "AutoMask")
++                cfg.DlssNrAutoMask = number() != 0;
++            else if (key == "MaskBlendMode")
++                cfg.DlssNrMaskBlendMode = (uint32_t) std::strtoul(value.c_str(), nullptr, 0);
++            else if (key == "RawModel") // preset/style without the 0..3 / 0..2 clamps
++                cfg.DlssNrRawModel = number() != 0;
++            else if (key == "Retry") // research build: clear a failed NR state, as the menu's retry does
++            {
++                if (number() != 0)
++                    DlssNr::RetryAfterFailure();
++            }
++            else if (key == "ControlMask")
++                cfg.DlssNrControlMask = number() != 0;
++            else if (key.rfind("MaskParam", 0) == 0) // MaskParam0..MaskParam15, see Config.h
++            {
++                const int index = std::atoi(key.c_str() + 9);
++                if (index >= 0 && index < 16)
++                    cfg.DlssNrMaskParams[index] = number();
++            }
++            else if (key == "RuntimeSlot")
++                cfg.DlssNrRuntimeSlot = (uint32_t) number();
++            else if (key == "GpuLogFrames")
++                cfg.DlssNrGpuLogFrames = (uint32_t) number();
+             else if (key == "LocalStructure")
+                 cfg.DlssNrLocalStructure = number();
+             else if (key == "LocalTone")
+diff --git a/OptiScaler/dlssnr/DlssNr_ModelParameters.h b/OptiScaler/dlssnr/DlssNr_ModelParameters.h
+index 0593e166..9dbc593c 100644
+--- a/OptiScaler/dlssnr/DlssNr_ModelParameters.h
++++ b/OptiScaler/dlssnr/DlssNr_ModelParameters.h
+@@ -10,6 +10,8 @@ struct ModelSettings
+     unsigned int preset = 0, style = 0;
+     float intensity = 1.0f, localStructure = 1.0f, localTone = 0.0f, skinStructure = -1.0f;
+     bool autoMask = true;
++    unsigned int maskBlendMode = 0;
++    unsigned int runtimeSlot = 0;
+     bool operator==(const ModelSettings&) const = default;
+ };
+ 
+@@ -21,6 +23,7 @@ inline void SetModelTuning(NVSDK_NGX_Parameter* params, const ModelSettings& set
+     params->Set("DLSSNR.LocalToneStrength", settings.localTone);
+     params->Set("DLSSNR.SkinStructureStrength", settings.skinStructure);
+     params->Set("DLSSNR.UseAutoMask", settings.autoMask ? 1u : 0u);
++    params->Set("DLSSNR.MaskBlendMode", settings.maskBlendMode);
+ }
+ 
+ inline void SetModelRegions(NVSDK_NGX_Parameter* params, GuideExtent size, const GuideRegions& guides)
+diff --git a/OptiScaler/dlssnr/DlssNr_Proxy.cpp b/OptiScaler/dlssnr/DlssNr_Proxy.cpp
+index ca565f91..d0326a8d 100644
+--- a/OptiScaler/dlssnr/DlssNr_Proxy.cpp
++++ b/OptiScaler/dlssnr/DlssNr_Proxy.cpp
+@@ -7,6 +7,9 @@
+ #include <Logger.h>
+ #include <proxies/NVNGX_Proxy.h>
+ #include <vector>
++#include <fstream>
++#include <State.h>
++#include <Util.h>
+ 
+ namespace
+ {
+@@ -24,8 +27,24 @@ struct ProxyState
+     ID3D12Device* device = nullptr;
+     bool failed = false;
+     bool reset = true;
++    unsigned int slotWaits = 0;
+ };
+ 
++// Research build: the runtime file for a slot (line N of nr-runtimes.txt next to this DLL).
++std::filesystem::path SlotRuntimePath(unsigned int slot)
++{
++    std::ifstream file(Util::DllPath().parent_path() / "nr-runtimes.txt");
++    std::string line;
++    for (unsigned int i = 1; std::getline(file, line); ++i)
++        if (i == slot)
++        {
++            while (!line.empty() && (line.back() == 13 || line.back() == 32))
++                line.pop_back();
++            return std::filesystem::path(line);
++        }
++    return {};
++}
++
+ void DestroyState(ProxyState& state)
+ {
+     if (state.feature != nullptr)
+@@ -154,16 +173,47 @@ unsigned int Context::Impl::Prepare(ID3D12GraphicsCommandList* cmdList, ID3D12De
+         NgxDiagnostics::Scope nrCreateTrace;
+         NgxDiagnostics::RuntimeReport(cmdList, device, "before CreateFeature(18)");
+         LOG_INFO("NR diagnostic creation: {}x{}, preset={}, style={}, intensity={}, structure={}, tone={}, "
+-                 "skin={}, autoMask={}, node masks=1/1, UI correction=1, UI/control/backbuffer=null, epoch={}",
++                 "skin={}, autoMask={}, maskBlend={}, runtimeSlot={}, node masks=1/1, UI correction=1, UI/control/backbuffer=null, epoch={}",
+                  width, height, settings.preset, settings.style, settings.intensity, settings.localStructure,
+-                 settings.localTone, settings.skinStructure, settings.autoMask, submissionEpoch);
++                 settings.localTone, settings.skinStructure, settings.autoMask, settings.maskBlendMode,
++                 settings.runtimeSlot, submissionEpoch);
+         SetCreationParameters(state.params, settings, width, height);
+ 
+         lifetime.Record(cmdList);
+-        auto created = NVNGXProxy::D3D12_CreateFeature()(cmdList, (NVSDK_NGX_Feature) 18, state.params, &state.feature);
+-        LOG_INFO("NR diagnostic CreateFeature(18): result=0x{:08X} handle={}", (unsigned) created,
+-                 (void*) state.feature);
+-        if (NVSDK_NGX_FAILED(created) && !state.feature)
++        NVSDK_NGX_Result created = NVSDK_NGX_Result_Fail;
++        if (settings.runtimeSlot != 0)
++        {
++            const auto path = SlotRuntimePath(settings.runtimeSlot);
++            state.compatibility = path.empty() ? nullptr
++                                               : CompatibilityRuntime::Open(path, device,
++                                                                            NVNGXProxy::D3D12_GetCapabilityParameters(),
++                                                                            NVNGXProxy::D3D12_DestroyParameters(),
++                                                                            State::Instance().NVNGX_ApplicationDataPath);
++            if (!state.compatibility)
++            {
++                // The previous slot's module may still be retiring; wait for it rather than failing.
++                if (!path.empty() && ++state.slotWaits < 600)
++                    return (unsigned int) NVSDK_NGX_Result_Success; // not ready yet (*ready stays false)
++                LOG_ERROR("NR research: runtime slot {} ({}) could not be opened", settings.runtimeSlot,
++                          path.string());
++                state.failed = true;
++                return (unsigned int) NVSDK_NGX_Result_Fail;
++            }
++            LOG_INFO("NR research: runtime slot {} = {} (after {} frame waits)", settings.runtimeSlot, path.string(),
++                     state.slotWaits);
++            state.slotWaits = 0;
++            SetCreationParameters(state.params, settings, width, height);
++            created = state.compatibility->Create(cmdList, state.params, &state.feature);
++            LOG_INFO("NR research: slot CreateFeature(18) result=0x{:08X} handle={}", (unsigned) created,
++                     (void*) state.feature);
++        }
++        else
++        {
++            created = NVNGXProxy::D3D12_CreateFeature()(cmdList, (NVSDK_NGX_Feature) 18, state.params, &state.feature);
++            LOG_INFO("NR diagnostic CreateFeature(18): result=0x{:08X} handle={}", (unsigned) created,
++                     (void*) state.feature);
++        }
++        if (settings.runtimeSlot == 0 && NVSDK_NGX_FAILED(created) && !state.feature)
+         {
+             state.compatibility = CompatibilityRuntime::TryOpen(device);
+             if (state.compatibility)
+@@ -223,6 +273,11 @@ unsigned int Context::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Device* devi
+     params->Set("DLSSNR.Depth", frame.depth);
+     params->Set("DLSSNR.MVec", frame.motion);
+     params->Set("DLSSNR.Output", frame.output);
++    params->Set("DLSSNR.ControlMask", frame.controlMask);
++    params->Set("DLSSNR.ControlMaskSubrectBaseX", 0u);
++    params->Set("DLSSNR.ControlMaskSubrectBaseY", 0u);
++    params->Set("DLSSNR.ControlMaskSubrectWidth", frame.controlMask ? frame.size.width : 0u);
++    params->Set("DLSSNR.ControlMaskSubrectHeight", frame.controlMask ? frame.size.height : 0u);
+ 
+     params->Set("DLSSNR.Enabled", 1u);
+     params->Set("DLSSNR.Width", frame.size.width);
+diff --git a/OptiScaler/dlssnr/DlssNr_Proxy.h b/OptiScaler/dlssnr/DlssNr_Proxy.h
+index 5c58023f..df2824c6 100644
+--- a/OptiScaler/dlssnr/DlssNr_Proxy.h
++++ b/OptiScaler/dlssnr/DlssNr_Proxy.h
+@@ -18,6 +18,7 @@ struct Frame
+     ID3D12Resource* depth = nullptr;
+     ID3D12Resource* motion = nullptr;
+     ID3D12Resource* output = nullptr;
++    ID3D12Resource* controlMask = nullptr; // research: NVIDIA ControlMask at the model's size, or null
+     GuideExtent size {};
+     GuideRegions guides {};
+     bool depthInverted = false, reset = false;
+diff --git a/OptiScaler/dlssnr/PassProfiles.h b/OptiScaler/dlssnr/PassProfiles.h
+index ed17e669..de6742db 100644
+--- a/OptiScaler/dlssnr/PassProfiles.h
++++ b/OptiScaler/dlssnr/PassProfiles.h
+@@ -27,8 +27,13 @@ inline ModelSettings PassSettings(const Config& cfg, unsigned int pass)
+         result.skinStructure = extra.skin.value_or(result.skinStructure);
+         result.autoMask = extra.autoMask.value_or(result.autoMask);
+     }
+-    result.preset = std::min(result.preset, 3u);
+-    result.style = std::min(result.style, 2u);
++    result.maskBlendMode = cfg.DlssNrMaskBlendMode.value_or_default();
++    result.runtimeSlot = cfg.DlssNrRuntimeSlot.value_or_default();
++    if (!cfg.DlssNrRawModel.value_or_default())
++    {
++        result.preset = std::min(result.preset, 3u);
++        result.style = std::min(result.style, 2u);
++    }
+     // Unlocked: any finite value goes to the model as entered; locked: the usual 0..2 (skin -1..2).
+     const bool unlocked = cfg.DlssNrUnlockStrengths.value_or_default();
+     const auto bounded = [unlocked](float value, float fallback, float minimum)
+diff --git a/OptiScaler/shaders/dlssnr/DlssNr_Common.h b/OptiScaler/shaders/dlssnr/DlssNr_Common.h
+index 66ce4483..c27f56f2 100644
+--- a/OptiScaler/shaders/dlssnr/DlssNr_Common.h
++++ b/OptiScaler/shaders/dlssnr/DlssNr_Common.h
+@@ -30,6 +30,7 @@ enum DlssNrMode : uint32_t
+     DlssNrMode_AutoExposure = 11,
+     DlssNrMode_ResizePrivateGuides = 10,
+     DlssNrMode_EncodeResizeField = 12,
++    DlssNrMode_ControlMask = 14,      // research: NVIDIA ControlMask (r intensity, g tone, b structure)
+     DlssNrMode_GuidedCoefficients = 13 // Transfer 5, two-pass: per low-res texel guided-filter a (u0) and b (u1)
+ };
+ 
+diff --git a/OptiScaler/shaders/dlssnr/DlssNr_Dx12_ModelState.h b/OptiScaler/shaders/dlssnr/DlssNr_Dx12_ModelState.h
+index a0ea6926..1238cd3e 100644
+--- a/OptiScaler/shaders/dlssnr/DlssNr_Dx12_ModelState.h
++++ b/OptiScaler/shaders/dlssnr/DlssNr_Dx12_ModelState.h
+@@ -23,6 +23,7 @@ struct ModelStateDx12
+     ID3D12Resource* passScratch = nullptr;
+     bool passScratchFailed = false;
+     ID3D12Resource* passClamp = nullptr; // bounded input for the next model pass
++    ID3D12Resource* controlMask = nullptr; // research: NVIDIA ControlMask (RGBA8, model size)
+ 
+     // The frame as the upscaler wrote it. The resolve adds the model's edit to this rather than
+     // reconstructing it by inverting the tone curve, which is what turned every light in the frame into
+diff --git a/OptiScaler/shaders/dlssnr/DlssNr_Dx12_Resources.cpp b/OptiScaler/shaders/dlssnr/DlssNr_Dx12_Resources.cpp
+index af3c2305..41cb808f 100644
+--- a/OptiScaler/shaders/dlssnr/DlssNr_Dx12_Resources.cpp
++++ b/OptiScaler/shaders/dlssnr/DlssNr_Dx12_Resources.cpp
+@@ -252,7 +252,8 @@ auto DlssNr_Dx12::State::ReleaseResources() -> void
+     modelRunning = false;
+ 
+     for (auto** resource :
+-         { &nr.output, &nr.passScratch, &nr.passClamp, &nr.colorCopy, &nr.hdrCopy, &nr.activeColor, &nr.colorSmall })
++         { &nr.output, &nr.passScratch, &nr.passClamp, &nr.colorCopy, &nr.hdrCopy, &nr.activeColor, &nr.colorSmall,
++           &nr.controlMask })
+         ParkNrResource(*resource);
+     ReleaseSpatialResources();
+     nr.spatialSignatureValid = false;
+diff --git a/OptiScaler/shaders/dlssnr/DlssNr_Dx12_Run.cpp b/OptiScaler/shaders/dlssnr/DlssNr_Dx12_Run.cpp
+index 347dc411..d24de456 100644
+--- a/OptiScaler/shaders/dlssnr/DlssNr_Dx12_Run.cpp
++++ b/OptiScaler/shaders/dlssnr/DlssNr_Dx12_Run.cpp
+@@ -414,6 +414,48 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
+     modelFrame.mvScaleX = spatial ? 1.0f : frame.MvScaleX * mvToWorkX;
+     modelFrame.mvScaleY = spatial ? 1.0f : frame.MvScaleY * mvToWorkY;
+ 
++    // Research: a per-pixel NVIDIA ControlMask (r intensity, g tone, b structure) at the model's size,
++    // built from the model's input picture, depth and motion. Lives in UNORDERED_ACCESS between frames.
++    bool controlMaskReadable = false;
++    if (!spatial && cfg.DlssNrControlMask.value_or_default())
++    {
++        const auto maskDesc = nr.controlMask ? nr.controlMask->GetDesc() : D3D12_RESOURCE_DESC {};
++        if (!nr.controlMask || maskDesc.Width != modelWidth || maskDesc.Height != modelHeight)
++        {
++            ParkNrResource(nr.controlMask);
++            nr.controlMask = CreateScratch(device, DXGI_FORMAT_R8G8B8A8_UNORM, modelWidth, modelHeight);
++            const float* p = cfg.DlssNrMaskParams;
++            LOG_INFO("DLSS-NR control mask {}x{}: base {}/{}/{}, far {}/{}/{} margin {}, dark {}..{} -> {}/{}, "
++                     "motion {}..{} -> {}/{}, MaskBlendMode {}",
++                     modelWidth, modelHeight, p[0], p[1], p[2], p[4], p[5], p[6], p[7], p[9], p[8], p[10], p[11], p[12],
++                     p[13], p[14], p[15], cfg.DlssNrMaskBlendMode.value_or_default());
++        }
++        if (nr.controlMask)
++        {
++            DlssNrConstants mask {};
++            mask.Mode = DlssNrMode_ControlMask;
++            mask.Width = modelWidth;
++            mask.Height = modelHeight;
++            mask.GuideWidth = guides.motion.width;
++            mask.GuideHeight = guides.motion.height;
++            mask.ResidualMotionBaseX = guides.motion.x;
++            mask.ResidualMotionBaseY = guides.motion.y;
++            mask.MvScaleX = modelFrame.mvScaleX;
++            mask.MvScaleY = modelFrame.mvScaleY;
++            for (int i = 0; i < 16; ++i)
++                mask.ExposureAnchors[i] = cfg.DlssNrMaskParams[i];
++            mask.ExposureAnchors[3] = frame.DepthInverted ? 1.0f : 0.0f;
++            if (shader.DispatchPass(cmdList, mask, modelInput, nullptr, depthIn, motionIn, nullptr, nr.controlMask,
++                                    nullptr))
++            {
++                Barrier(cmdList, nr.controlMask, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++                controlMaskReadable = true;
++                modelFrame.controlMask = nr.controlMask;
++            }
++        }
++    }
++
+     for (unsigned int pass = 0; pass < effectivePasses && result == NVSDK_NGX_Result_Success; ++pass)
+     {
+         MakeModelWritable(passOutput);
+@@ -452,6 +494,9 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
+ 
+     ngxTime->End(cmdList);
+     DlssNr::HudlessProfile::Mark(cmdList, "NR model");
++    if (controlMaskReadable)
++        Barrier(cmdList, nr.controlMask, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+ 
+     nr.reset = clampFailed || finalAnswer == nullptr;
+     bool spatialUnpacked = false;
+diff --git a/OptiScaler/shaders/dlssnr/DlssNr_Dx12_Status.cpp b/OptiScaler/shaders/dlssnr/DlssNr_Dx12_Status.cpp
+index 001cd2f4..08744489 100644
+--- a/OptiScaler/shaders/dlssnr/DlssNr_Dx12_Status.cpp
++++ b/OptiScaler/shaders/dlssnr/DlssNr_Dx12_Status.cpp
+@@ -81,7 +81,7 @@ void DlssNr_Dx12::State::EndGpuTiming(ID3D12GraphicsCommandList* cmdList)
+ 
+     if (lastGpuTime && lastNgxTime)
+         vitals.Push(*lastGpuTime, *lastNgxTime);
+-    if (lastGpuTime && lastNgxTime && frames - lastSplitLog > 600)
++    if (lastGpuTime && lastNgxTime && frames - lastSplitLog > Config::Instance()->DlssNrGpuLogFrames.value_or_default())
+     {
+         lastSplitLog = frames;
+         const auto window = vitals.Read();
+diff --git a/OptiScaler/shaders/dlssnr/precompile/dlssnr.hlsl b/OptiScaler/shaders/dlssnr/precompile/dlssnr.hlsl
+index 0675507e..da46c68d 100644
+--- a/OptiScaler/shaders/dlssnr/precompile/dlssnr.hlsl
++++ b/OptiScaler/shaders/dlssnr/precompile/dlssnr.hlsl
+@@ -449,6 +449,57 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 gr
+ {
+     const uint lane = groupThreadId.y * 8u + groupThreadId.x;
+ 
++    if (gMode == 14)
++    {
++        // Control mask for NVIDIA's DLSSNR.ControlMask, at the model's size: r = intensity (final blend),
++        // g = local tone, b = local structure. Mode 14 reads its settings from gExposureAnchors:
++        // [0] base r, g, b, depth inverted; [1] sky r, g, b, sky depth margin (0 = off);
++        // [2] dark start, dark full (luma), dark r, dark b; [3] motion start, full (model pixels), motion r, b.
++        // t0 = the model's input picture, t2 = depth, t3 = motion vectors (guide region gGuideWidth/Height).
++        if (id.x >= gWidth || id.y >= gHeight)
++            return;
++        const float4 p0 = gExposureAnchors[0], p1 = gExposureAnchors[1];
++        const float4 p2 = gExposureAnchors[2], p3 = gExposureAnchors[3];
++        float3 mask = p0.xyz;
++        const float2 uv = (float2(id.xy) + 0.5) / float2(gWidth, gHeight);
++        const uint2 guideMax = uint2(max(gGuideWidth, 1u) - 1u, max(gGuideHeight, 1u) - 1u);
++        const uint2 guide = min(uint2(uv * float2(gGuideWidth, gGuideHeight)), guideMax);
++        if (p1.w > 0.0)
++        {
++            // Soft far/sky weight: full at depth <= margin, none at twice the margin (reversed depth; mirrored
++            // for ordinary depth), averaged over 5x5 depth texels so silhouettes do not flicker with jitter.
++            float far = 0.0;
++            [unroll] for (int dy = -2; dy <= 2; ++dy)
++            {
++                [unroll] for (int dx = -2; dx <= 2; ++dx)
++                {
++                    const uint2 at = (uint2) clamp(int2(guide) + int2(dx, dy), int2(0, 0), int2(guideMax));
++                    float depth = gOriginal.Load(int3(at, 0)).r;
++                    depth = p0.w > 0.5 ? depth : 1.0 - depth;
++                    far += saturate((2.0 * p1.w - depth) / p1.w);
++                }
++            }
++            mask = lerp(mask, p1.xyz, far / 25.0);
++        }
++        if (p2.x > p2.y)
++        {
++            const float luma = dot(saturate(gSource.Load(int3(id.xy, 0)).rgb), kLuma);
++            const float w = 1.0 - smoothstep(p2.y, p2.x, luma);
++            mask.r = lerp(mask.r, p2.z, w);
++            mask.b = lerp(mask.b, p2.w, w);
++        }
++        if (p3.y > p3.x)
++        {
++            const uint2 motionAt = guide + uint2(gResidualMotionBaseXUnused, gResidualMotionBaseYUnused);
++            const float2 mv = gMotion.Load(int3(motionAt, 0)).xy * float2(gMvScaleX, gMvScaleY);
++            const float w = smoothstep(p3.x, p3.y, length(mv));
++            mask.r = lerp(mask.r, p3.z, w);
++            mask.b = lerp(mask.b, p3.w, w);
++        }
++        gTarget[id.xy] = float4(saturate(mask), 1.0);
++        return;
++    }
++
+     if (gMode == 3)
+     {
+         if (groupId.x >= gWidth || groupId.y >= gHeight)

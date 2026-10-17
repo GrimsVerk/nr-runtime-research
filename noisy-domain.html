@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Noisy-Domain NR</title><style>:root{--bg:#f6f5f2;--card:#fff;--ink:#1d1d1f;--muted:#6b6b70;--line:#e2e0db;--accent:#2d5fd3}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#141416;--card:#1d1d21;--ink:#ecebe8;--muted:#9a99a0;--line:#303036;--accent:#6f97ff}}
+:root[data-theme="dark"]{--bg:#141416;--card:#1d1d21;--ink:#ecebe8;--muted:#9a99a0;--line:#303036;--accent:#6f97ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1200px;margin:0 auto;padding:24px 16px 60px}a{color:var(--accent)}
+h1{font-size:26px;margin:0 0 8px}h2{font-size:19px;margin:28px 0 8px;padding-top:8px;border-top:1px solid var(--line)}h3{font-size:16px;margin:18px 0 6px}
+table{border-collapse:collapse;width:100%;font-size:13.5px;margin:8px 0 14px;display:block;overflow-x:auto}
+td,th{padding:5px 8px;border:1px solid var(--line);vertical-align:top;text-align:left}th{background:var(--card)}
+code{font-size:12.5px;background:var(--card);padding:1px 5px;border-radius:5px;border:1px solid var(--line);word-break:break-word}
+pre{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px;overflow-x:auto}pre code{border:0;padding:0}
+li{margin:3px 0}hr{border:0;border-top:2px solid var(--line);margin:30px 0}</style></head><body><main>
+<h1>Noisy-domain NR: feasibility (write-up only, nothing built)</h1>
+<p><a href="index.html">Back to the report</a> · <a href="static.html">Static analysis</a> · <a href="controlmask.html">ControlMask how-to</a></p>
+<p><strong>Written by Claude Opus 5.5 (Claude Code, high effort) on behalf of GrimsVerk, who skimmed it. The research, the test-build code changes, the measurements and this text are Claude's work.</strong></p>
+<p><strong>The idea (GrimsVerk's):</strong> run the NR edit on the noisy, jittered, internal-resolution path-traced render (before DLSS Ray Reconstruction), and output the same noisy, jittered image with the NR edit applied. RR then works as usual. NR would cost less (fewer pixels), and the final picture would be better because RR reconstructs the edit together with everything else.</p>
+<p><strong>Short answer:</strong> the cost argument does not hold any more. OptiScaler-NR can already run the model at internal resolution (WorkingScale 0.5 = 1920x1080 for a 4K screen) on the clean finished picture, so moving it before RR saves no model time. It <em>adds</em> a denoise pass. What remains is a possible <em>quality</em> gain: RR may enlarge the edit more faithfully than OptiScaler-NR's guided enlargement. No NVIDIA parameter or mode accepts noisy, linear or HDR input. The only realistic route is one that GrimsVerk's OptiScaler-NR fork already has (DenoiseFirst step 2). The smallest experiment is one photo-mode session with existing code.</p>
+<h2>1. What the runtimes accept (from the static analysis)</h2>
+<p>None of the controls found in either version makes NR work in a noisy or linear domain:</p>
+<table>
+<thead>
+<tr>
+<th>Question</th>
+<th>Answer</th>
+<th>Evidence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Colour range</td>
+<td>display-referred RGB in [0, 1] only. Encoded as (c - 0.5)/8 for the network; output clamped to [0, 1]; alpha written as 1</td>
+<td>pre-block / post-process PTX</td>
+</tr>
+<tr>
+<td>Linear or HDR input, exposure</td>
+<td>none. No exposure parameter, no sRGB/PQ conversion, no HDR path</td>
+<td>parameter list, both versions</td>
+</tr>
+<tr>
+<td>Noise</td>
+<td>the network already gets <strong>its own</strong> per-frame Gaussian noise in 3 input channels. It is a generative model trained to add detail on top of a clean picture. Path-tracer noise in the colour input is just more "texture" to it</td>
+<td>input channels 0-2</td>
+</tr>
+<tr>
+<td>Temporal</td>
+<td>it fetches its own previous output at uv + mv x scale / size and blends with it through a learned weight. With a jittered input and jitter-free motion vectors, the history would be misaligned by the jitter every frame</td>
+<td>pre-block PTX</td>
+</tr>
+<tr>
+<td>Depth, guides</td>
+<td>no depth (the network's depth slot is hard-wired to null); MVec only for history</td>
+<td>CreateFeature/Evaluate</td>
+</tr>
+<tr>
+<td>Lower working resolution</td>
+<td>the network runs at whatever size Color has. The runtime's own reduced-resolution path is dead code</td>
+<td>section 6 of <a href="static.html">static.html</a></td>
+</tr>
+<tr>
+<td>Hidden "noisy" or "pre-upscale" mode</td>
+<td>none. Two models, three styles, no other configs, no debug views</td>
+<td>weight registry, descriptor list</td>
+</tr>
+</tbody>
+</table>
+<p>So the network sees noisy, jittered, linear HDR input as an out-of-range, grainy SDR picture. That is consistent with what the fork measured on 2026-10-04 in The Witcher 3.</p>
+<h2>2. What the fork already tried (do not repeat)</h2>
+<p>From the fork's history and its 2026-10-04/05 captures in The Witcher 3:</p>
+<ul>
+<li><strong>NR directly on the noisy 1080p pre-RR frame</strong> ("Generate model before upscale"). NR edits about 60 % of the pixels, but almost only coarse tone and colour (rms 0.093 above 32 px). The fine detail it adds is tiny and temporally unstable (rms 0.016, frame-to-frame correlation 0.40). RR passes the coarse and mid bands through almost unchanged, and the final local contrast was 2 % <em>lower</em> with NR on.<ul>
+<li>Conclusion then: noise makes NR skip detail synthesis; it is not RR erasing it. This is the direct version of the idea, and it does not work with NVIDIA's models.</li>
+</ul>
+</li>
+<li><strong>DenoiseFirst</strong> ("Denoise at native, then NR, then upscale", INI <code>DenoiseFirst*</code>), three second steps (INI <code>DenoiseFirstStep</code> 0/1/2):<ol start="0">
+<li>upscale the NR'd clean image again with RR, zero jitter: softer (detail -8 % vs no NR);</li>
+<li>upscale it with plain DLSS SR, zero jitter: softer (-24 %) and flickers;</li>
+<li><strong>edit = NR(clean) / clean as a ratio, resampled by the frame's jitter and applied to the raw jittered render, then the game's normal RR</strong>: <strong>the winner</strong>. RR kept the edits temporally stable. The ratio halved colour noise compared with adding the difference. It boosted path-tracer fireflies on dark floors 1.3-1.6x, so a firefly guard was added (<code>DenoiseFirstFireflyGuard</code>, on by default).</li>
+</ol>
+</li>
+<li><strong>Finished-picture NR at reduced scale + guided residual enlargement</strong> (Transfer 5, the fork's current default approach) replaced all of that for daily use. It is cheaper and simpler, and HUD-safe with FG.</li>
+</ul>
+<p><strong>Step 2 is the idea, built.</strong> "Pre-denoise, NR on the clean image, carry the edit back onto the noisy jittered signal before RR" is exactly what it does, with a 1:1 RR pass as the denoiser.</p>
+<h2>3. Cost, honestly</h2>
+<p>Measured in this research (model only, 4K output, NR GPU timer):</p>
+<table>
+<thead>
+<tr>
+<th>NR placement</th>
+<th>pixels</th>
+<th>small model</th>
+<th>old model</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>finished picture, full 4K</td>
+<td>8.3 MP</td>
+<td>7.12 ms</td>
+<td>12.65 ms (310.8)</td>
+</tr>
+<tr>
+<td>finished picture, WorkingScale 0.5</td>
+<td>2.07 MP</td>
+<td>2.23 ms</td>
+<td>3.89 ms</td>
+</tr>
+<tr>
+<td>before RR at internal res 1920x1080 (the idea)</td>
+<td>2.07 MP</td>
+<td>2.23 ms</td>
+<td>3.89 ms</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>The model costs the same in both placements</strong> at WorkingScale 0.5, because it processes the same number of pixels.</li>
+<li><strong>Before-RR placement adds work:</strong> a denoise of the noisy render (in DenoiseFirst, an extra 1:1 DLSS-RR evaluation at 1080p), the edit transfer, and the firefly guard. Guided enlargement (about 0.5 ms of "surrounding work" in the GPU window logs) goes away. The extra RR pass was not measured here. RR is the most expensive DLSS feature, so expect it to cost more than the enlargement it replaces (an estimate, to be measured).</li>
+<li><strong>So the idea is not a speed win any more.</strong> It can only win on picture quality: RR reconstructs the edit at 4K with its temporal super-resolution, instead of a guided enlargement from 1080p. The resolution sweep shows how much the enlargement loses: "detail lost" at 0.5 against full 4K NR is 0.22-0.67, depending on the subject (smallest on Yennefer, largest on the tavern faces and Geralt's dark scene). That is the gap the idea would have to close.</li>
+</ul>
+<h2>4. Routes</h2>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>What it needs</th>
+<th>Expected quality</th>
+<th>Cost per frame</th>
+<th>Effort</th>
+<th>Verdict</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>A. An existing parameter or model</strong></td>
+<td>nothing</td>
+<td>n/a</td>
+<td>n/a</td>
+<td>n/a</td>
+<td><strong>not possible</strong>: no mode accepts noisy/linear/HDR input, and no hidden model exists (section 1)</td>
+</tr>
+<tr>
+<td><strong>B. Cheap pre-denoise -&gt; NR -&gt; edit back onto the noisy signal (ratio) -&gt; RR</strong></td>
+<td>already in the fork as DenoiseFirst step 2 (1:1 RR as the denoiser, ratio transfer, jitter resampling, firefly guard). A cheaper denoiser (a few-tap spatial/temporal filter) could replace the 1:1 RR pass, but NR's detail synthesis needs a really clean input, so a cheap denoiser probably gives the same "coarse tone only" result as raw input</td>
+<td>possibly better detail than guided enlargement; risks: fireflies (guarded), double temporal filtering (NR history + RR history), jitter alignment, HUD-less ordering with FG (NR would run before the HUD anyway, so HUD-safe)</td>
+<td>model as today + one extra RR (or denoise) pass - enlargement (~0.5 ms)</td>
+<td>low: exists; needs a measurement, maybe a cheaper denoiser</td>
+<td><strong>worth one experiment</strong></td>
+</tr>
+<tr>
+<td><strong>C. A new or fine-tuned model that maps noisy -&gt; noisy+edit directly</strong></td>
+<td>training data: thousands of matched frames (noisy jittered internal render + guides, target = the same noisy render with the edit that NR applies to the converged frame, i.e. a teacher-student setup using NVIDIA NR as the teacher). A training pipeline, an inference engine in the fork (DirectML/D3D12 compute, &lt; 1-2 ms at 1080p)</td>
+<td>well below NVIDIA's model at first; the edit is generative (NR samples noise), so a student learning it from noisy inputs is hard</td>
+<td>own network, can be small</td>
+<td>very high (months)</td>
+<td><strong>not recommended</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Legal limits for route C.</strong> The NVIDIA weights are proprietary and come with NVIDIA's runtime licence. Fine-tuning them, extracting them into another engine, or redistributing them is out. Training a <em>new</em> network on outputs of NVIDIA's model (distillation) is a grey area: NVIDIA's SDK licences generally forbid using their software to build competing models, and the runtimes used here are game-bundled copies. Read the DLSS/NGX licence terms before doing anything public. For private experiments, B uses NVIDIA's runtime exactly as it is meant to be used, just on a different picture.</p>
+<h2>5. Recommendation and the smallest experiment</h2>
+<p><strong>Recommendation:</strong> keep the current finished-picture NR (small model, WorkingScale 0.5, Transfer 5) for daily use. Run <em>one</em> experiment with the existing DenoiseFirst step 2 code to find out whether the RR-reconstructed edit beats guided enlargement enough to pay for the extra RR pass. Build nothing new unless it clearly does.</p>
+<p><strong>Smallest experiment (one game session, no new code):</strong> use the research build's live control and the frozen photo-mode frames from the report (Geralt, Yennefer, the tavern faces and houses).</p>
+<ol>
+<li>Reference: small model on the finished picture at WorkingScale 1.0 (the "ideal" edit).</li>
+<li>A: WorkingScale 0.5, Transfer 5 (finished picture).</li>
+<li>B: DenoiseFirst step 2 with the small model at internal resolution (1920x1080), ratio edit, firefly guard on.</li>
+<li>Measure, as in the report: detail lost against the reference (A against the reference is already known: 0.22-0.67), the model GPU time plus the <em>total</em> NR GPU window (it includes the extra RR pass), flicker in the frozen frame, and one 3-second camera pan for temporal stability.</li>
+</ol>
+<p><strong>Decision rule:</strong> B is only worth pursuing if its detail loss is clearly below A's (for example under half) at a total extra cost below about 1 ms, with no visible fireflies or ghosting in the pan. If B's loss is no better than A's, the idea is closed: NR before RR then costs more for the same picture.</p>
+<p><em>Prediction (to be proven or disproven by the experiment):</em> B will cost 1-3 ms more than A for a small detail gain, because the 1:1 RR pass that cleans the input costs about as much as the model itself. The fork's earlier step-2 captures looked good, but they were never measured against guided enlargement at equal cost.</p>
+</main></body></html>
