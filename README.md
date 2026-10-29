@@ -18,3 +18,7 @@ Measurements and pictures come from a research build of [GrimsVerk's OptiScaler-
 The repository contains only HTML pages, JPEG screenshots and a source patch. No DLLs, executables, model weights or NVIDIA code.
 
 To view offline: download the repository (Code > Download ZIP), extract it, and open `index.html`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
